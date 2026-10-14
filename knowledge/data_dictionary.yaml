@@ -17,7 +17,7 @@ tables:
       order_id: {type: INT64, description: Order identifier (primary key).}
       user_id: {type: INT64, description: Customer who placed the order (FK users.id). Pseudonymous key, not PII by itself.}
       status: {type: STRING, description: Order status., values: [Processing, Shipped, Complete, Cancelled, Returned]}
-      gender: {type: STRING, description: Customer gender copied onto the order., values: [M, F]}
+      gender: {type: STRING, description: Customer gender copied onto the order., values: [M, F], aggregate_only: true}
       created_at: {type: TIMESTAMP, description: When the order was placed (UTC).}
       returned_at: {type: TIMESTAMP, description: When the order was returned; NULL if not returned.}
       shipped_at: {type: TIMESTAMP, description: When the order shipped; NULL if not shipped.}
@@ -55,23 +55,27 @@ tables:
       distribution_center_id: {type: INT64, description: Distribution centre that stocks the product.}
 
   users:
-    description: Customers. Contains PII; only the non-PII columns are available to the agent.
+    description: >-
+      Customers. PII columns are never available. Demographic and location columns
+      (aggregate_only) may only be shown as aggregates across customers, never next to an
+      individual customer and never as a filter on a customer-level list. Refer to customers
+      by id / user_id.
     grain: id
     columns:
       id: {type: INT64, description: Customer identifier (pseudonymous key).}
       first_name: {type: STRING, pii: true}
       last_name: {type: STRING, pii: true}
       email: {type: STRING, pii: true}
-      age: {type: INT64, description: Age in years. Prefer age bands in outputs.}
-      gender: {type: STRING, description: Gender., values: [M, F]}
-      state: {type: STRING, description: State / province / region.}
+      age: {type: INT64, description: Age in years. Use age bands., aggregate_only: true}
+      gender: {type: STRING, description: Gender., values: [M, F], aggregate_only: true}
+      state: {type: STRING, description: State / province / region., aggregate_only: true}
       street_address: {type: STRING, pii: true}
       postal_code: {type: STRING, pii: true}
-      city: {type: STRING, description: City.}
-      country: {type: STRING, description: Country name, e.g. United States, China, Brazil.}
+      city: {type: STRING, description: City., aggregate_only: true}
+      country: {type: STRING, description: "Country name, e.g. United States, China, Brazil.", aggregate_only: true}
       latitude: {type: FLOAT64, pii: true}
       longitude: {type: FLOAT64, pii: true}
-      traffic_source: {type: STRING, description: Acquisition channel., values: [Search, Organic, Facebook, Email, Display]}
+      traffic_source: {type: STRING, description: Acquisition channel., values: [Search, Organic, Facebook, Email, Display], aggregate_only: true}
       created_at: {type: TIMESTAMP, description: When the customer signed up (UTC).}
       user_geom: {type: GEOGRAPHY, pii: true}
 

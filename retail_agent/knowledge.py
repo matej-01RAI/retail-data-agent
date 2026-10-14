@@ -23,6 +23,7 @@ class Column:
     type: str
     description: str = ""
     pii: bool = False
+    aggregate_only: bool = False  # quasi-identifier: only as an aggregate across customers
     values: tuple[str, ...] = ()
 
 
@@ -62,6 +63,7 @@ class DataDictionary:
                     type=cspec.get("type", ""),
                     description=cspec.get("description", ""),
                     pii=bool(cspec.get("pii", False)),
+                    aggregate_only=bool(cspec.get("aggregate_only", False)),
                     values=tuple(cspec.get("values", ())),
                 )
             tables[tname] = Table(tname, tspec.get("description", ""), tspec.get("grain", ""), cols)
@@ -89,6 +91,7 @@ class DataDictionary:
                 if c.pii:
                     continue
                 extra = f" in {list(c.values)}" if c.values else ""
+                extra += " (aggregates only)" if c.aggregate_only else ""
                 cols.append(f"{c.name} {c.type}{extra}")
             lines.append(f"- {self.fq(t.name)}: {t.description} Columns: {', '.join(cols)}")
             if t.pii_columns:
@@ -111,7 +114,12 @@ class DataDictionary:
                 "description": t.description,
                 "grain": t.grain,
                 "columns": {
-                    c.name: {"type": c.type, "description": c.description, **({"values": list(c.values)} if c.values else {})}
+                    c.name: {
+                        "type": c.type,
+                        "description": c.description,
+                        **({"values": list(c.values)} if c.values else {}),
+                        **({"rule": "aggregates across customers only"} if c.aggregate_only else {}),
+                    }
                     for c in t.columns.values()
                     if not c.pii
                 },

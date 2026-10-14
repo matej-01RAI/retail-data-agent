@@ -394,6 +394,16 @@ def doctor(args: argparse.Namespace) -> None:
         )
         result = warehouse.query(q.sql, labels={"app": "retail-agent", "user": "doctor"}, max_rows=1)
         line(True, "Test query", f"{result.rows[0]} ({result.bytes_processed} bytes)")
+        from .identity import load_users
+
+        for user in load_users(settings.users_path).values():
+            if user.scope.unrestricted:
+                continue
+            q = guard.prepare(
+                "SELECT COUNT(*) AS products FROM `bigquery-public-data.thelook_ecommerce.products`", user.scope
+            )
+            n = warehouse.query(q.sql, labels={"app": "retail-agent", "user": "doctor"}, max_rows=1).rows[0][0]
+            line(n > 0, f"Scope of '{user.id}' matches products", f"{user.scope.describe()}: {n} products")
     except Exception as e:  # noqa: BLE001
         line(False, "Warehouse", f"{type(e).__name__}: {str(e)[:300]}")
     console.print("[green]All checks passed.[/green]" if ok else "[yellow]Some checks failed (see above).[/yellow]")

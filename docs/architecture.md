@@ -19,14 +19,14 @@ reports. The system must:
 - improve over time;
 - let non-developers change its tone weekly.
 
-**Assumptions** (questions raised with OpsFleet; these defaults apply until answered):
+**Assumptions.** These are the questions raised with OpsFleet. A3 and A4 were confirmed by OpsFleet; the rest are defaults until answered.
 
 | # | Topic | Assumption |
 |---|---|---|
 | A1 | Cloud | GCP: the data is in BigQuery and Gemini is preferred. Single region (EU or US to match the data). |
 | A2 | Identity | Company SSO via an OIDC/SAML IdP (Google Workspace, Okta or Entra), federated into GCP. |
-| A3 | Entitlements | "Products related to him" = a product slice by brand / category / department, managed by an entitlement service or IdP groups. Some roles (CEO) see everything. |
-| A4 | PII | Direct identifiers: name, email, street address, postal code, latitude/longitude, geometry. Analysable: age (as bands), gender, city, state, country, traffic source. The internal `user_id` is a pseudonymous key and may be shown. Groups smaller than 5 customers are suppressed. |
+| A3 | Entitlements | **Confirmed:** each manager analyses only their own brands; the CEO sees everything. Customer and order data are visible only through purchases of in-scope products. The manager-to-brands mapping is ours to define: a config file in the prototype, an access table in production. (The model also supports category and department scopes.) |
+| A4 | PII | **Confirmed:** first name, last name, email, street address, postal code and exact coordinates never appear in output or reach the LLM. City, state, country, age, gender and traffic source only in aggregates. Customers are referenced by `user_id` or a stable salted-hash pseudonym. We add a minimum group size of 5 in production. |
 | A5 | LLM data handling | Raw PII must not be sent to the LLM provider, even under enterprise terms. |
 | A6 | Definitions | Revenue excludes Cancelled and Returned lines. Churn = no order within 90 days. Calendar quarters. All held in the semantic layer, owned by the data team. |
 | A7 | Golden bucket | JSON trios in GCS, curated by an analyst team that can review agent-proposed candidates. |
@@ -300,7 +300,7 @@ flowchart TB
 | Data | Store | Contains PII? | Retention | Access |
 |---|---|---|---|---|
 | Raw transaction logs | BigQuery (source) | Yes | Owned by the data team | Agent SAs: authorized views only; no access to PII columns (policy tags) |
-| Scoped analysis views | BigQuery authorized views | No | n/a | One per entitlement scope, granted to that scope's SA |
+| Scoped analysis views | BigQuery authorized views (customer attributes behind an aggregation-threshold view) | No | n/a | One per brand scope, granted to that scope's SA |
 | Golden trios | GCS bucket (versioned) + index | No (PII-scanned on ingest) | Indefinite, versioned | Read: agent. Write: analysts via review |
 | Semantic layer (dictionary, metrics) | Git + GCS | No | Versioned | Data team |
 | Conversations (messages, tool results) | Cloud SQL | No (inputs masked, data PII-free by construction) | 90 days | Owner; support via break-glass with audit |

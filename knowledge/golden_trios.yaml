@@ -40,23 +40,22 @@ trios:
     sql: |
       SELECT
         oi.user_id AS customer_id,
-        u.country,
-        u.state,
-        CASE WHEN u.age < 25 THEN 'under 25' WHEN u.age < 35 THEN '25-34'
-             WHEN u.age < 50 THEN '35-49' ELSE '50+' END AS age_band,
         COUNT(DISTINCT oi.order_id) AS orders,
-        ROUND(SUM(oi.sale_price), 2) AS total_spend
+        ROUND(SUM(oi.sale_price), 2) AS total_spend,
+        MIN(DATE(oi.created_at)) AS first_order,
+        MAX(DATE(oi.created_at)) AS last_order
       FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
-      JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
       WHERE oi.status NOT IN ('Cancelled', 'Returned')
-      GROUP BY customer_id, u.country, u.state, age_band
+      GROUP BY customer_id
       ORDER BY total_spend DESC
       LIMIT 10
     report: >-
-      Customers are identified by customer ID and described by non-personal attributes only
-      (country, state, age band); names and contact details are never reported. Put the list in
-      context: the top 10's share of total revenue shows how concentrated the business is, and
-      orders per top customer shows whether they are frequent buyers or one-off big baskets.
+      Customers are listed by customer ID with their purchase metrics only. Their location,
+      age, gender and channel are never shown per customer (company rule: those attributes
+      only in aggregates). To profile the best customers, run a separate aggregated query over
+      the top segment, e.g. the top 100 customers' share by country or age band. Put the list
+      in context: the top 10's share of total revenue shows concentration, and orders per
+      customer shows whether they are frequent buyers or one-off big baskets.
 
   - id: GK-003
     question: Why are users in Texas underspending compared to users in California?

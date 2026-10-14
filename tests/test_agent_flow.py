@@ -11,7 +11,7 @@ from pydantic_ai.models.function import FunctionModel
 
 from retail_agent.llm import FaultInjectingModel
 
-from .conftest import ITEMS, PRODUCTS, USERS, Script, StubUI, call, last_tool_feedback, say
+from .conftest import ITEMS, ORDERS, PRODUCTS, USERS, Script, StubUI, call, last_tool_feedback, say
 
 GOOD_SQL = f"SELECT status, COUNT(*) AS n FROM {ITEMS} GROUP BY status ORDER BY n DESC"
 
@@ -89,7 +89,7 @@ async def test_pii_query_is_rejected_and_never_reaches_output(make_assistant, se
 
     def safe(messages, info):
         seen["feedback"] = last_tool_feedback(messages)
-        return call("run_sql", sql=f"SELECT u.id, u.country FROM {USERS} u ORDER BY u.id LIMIT 3", purpose="customers")
+        return call("run_sql", sql=f"SELECT user_id, SUM(sale_price) AS spend FROM {ITEMS} GROUP BY 1 ORDER BY spend DESC LIMIT 3", purpose="customers")
 
     script = Script(
         call("run_sql", sql=f"SELECT first_name, email FROM {USERS} LIMIT 3", purpose="customer emails"),
@@ -103,18 +103,65 @@ async def test_pii_query_is_rejected_and_never_reaches_output(make_assistant, se
     assert row["sql_rejected"] == 1 and row["pii_redactions"] >= 1
 
 
-async def test_select_star_on_users_cannot_return_pii_columns(make_assistant):
+async def test_select_star_on_users_is_rejected_without_leaking(make_assistant):
     captured = {}
 
     def capture(messages, info):
-        captured["rows"] = last_tool_feedback(messages)
+        captured["feedback"] = last_tool_feedback(messages)
         return say("ok")
 
     script = Script(call("run_sql", sql=f"SELECT * FROM {USERS} LIMIT 2", purpose="peek"), capture)
     await make_assistant(script).ask("peek at users")
+    assert "one row per customer" in captured["feedback"]
     for column in ("first_name", "last_name", "email", "street_address", "postal_code", "latitude"):
-        assert column not in captured["rows"]
-    assert "@example.com" not in captured["rows"]
+        assert column not in captured["feedback"]
+    assert "@example.com" not in captured["feedback"]
+
+
+async def test_customer_attributes_only_as_aggregates(make_assistant, services):
+    """OpsFleet rule: city/state/country/age/gender/traffic source only in aggregates."""
+    seen = {}
+
+    def aggregate_instead(messages, info):
+        seen["feedback"] = last_tool_feedback(messages)
+        return call("run_sql", purpose="customers by state",
+                    sql=f"SELECT u.state, COUNT(DISTINCT u.id) AS customers FROM {USERS} u GROUP BY u.state")
+
+    script = Script(
+        call("run_sql", purpose="top customers with state",
+             sql=f"SELECT oi.user_id, u.state, SUM(oi.sale_price) AS spend FROM {ITEMS} oi "
+                 f"JOIN {USERS} u ON u.id = oi.user_id GROUP BY 1, 2 ORDER BY spend DESC LIMIT 5"),
+        aggregate_instead,
+        say("By state: ..."),
+    )
+    result = await make_assistant(script).ask("Top 5 customers and which state each lives in")
+    assert "one row per customer" in seen["feedback"]
+    row = turn_row(services, result.turn_id)
+    assert [e["status"] for e in row["sql_events"]] == ["rejected", "ok"]
+    assert row["sql_events"][0]["error_kind"] == "customer_attributes"
+
+
+async def test_scoped_orders_count_only_in_scope_items(make_assistant):
+    """Customer and order data are visible only through purchases of in-scope products."""
+    feedback = []
+
+    def record(step):
+        def inner(messages, info):
+            feedback.append(last_tool_feedback(messages))
+            return step
+
+        return inner
+
+    script = Script(
+        call("run_sql", sql=f"SELECT SUM(num_of_item) AS items FROM {ORDERS}", purpose="items via orders"),
+        record(call("run_sql", sql=f"SELECT COUNT(*) AS items FROM {ITEMS}", purpose="items via lines")),
+        record(say("same")),
+    )
+    await make_assistant(script, user="tom").ask("How many items did my customers' orders contain?")
+    import re
+
+    via_orders, via_lines = (re.search(r"'rows': \[\[(\d+)", f).group(1) for f in feedback)
+    assert via_orders == via_lines
 
 
 async def test_user_scope_is_enforced_in_sql_not_by_the_model(make_assistant):
@@ -124,12 +171,12 @@ async def test_user_scope_is_enforced_in_sql_not_by_the_model(make_assistant):
         captured["rows"] = last_tool_feedback(messages)
         return say("ok")
 
-    sql = f"SELECT DISTINCT p.category FROM {PRODUCTS} p ORDER BY 1"
-    script = Script(call("run_sql", sql=sql, purpose="categories"), capture)
-    await make_assistant(script, user="tom").ask("Which categories exist?")
-    assert "Jeans" in captured["rows"] and "Outerwear & Coats" in captured["rows"]
-    assert "Dresses" not in captured["rows"] and "Socks" not in captured["rows"]
-    assert "Results only include products where category in" in captured["rows"]
+    sql = f"SELECT DISTINCT p.brand FROM {PRODUCTS} p ORDER BY 1"
+    script = Script(call("run_sql", sql=sql, purpose="brands"), capture)
+    await make_assistant(script, user="tom").ask("Which brands exist?")
+    assert "Levi's" in captured["rows"] and "Carhartt" in captured["rows"]
+    assert "Calvin Klein" not in captured["rows"] and "Columbia" not in captured["rows"]
+    assert "Results only include products where brand in" in captured["rows"]
 
 
 async def test_prompt_injection_is_blocked_before_any_model_call(make_assistant, services):

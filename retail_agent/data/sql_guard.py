@@ -16,6 +16,11 @@ reach BigQuery. It does not trust the model, the prompt or the user:
    (a) projects only the non-PII columns and (b) filters rows to the user's
    product entitlement. So even a query the checks above missed cannot see
    PII or another team's products: those rows and columns are not in its FROM.
+   Customers and orders are visible only through purchases of in-scope
+   products, and an order's num_of_item counts only its in-scope items.
+5. Customer attributes only in aggregates (aggregate_rule.py): city, state,
+   country, age, gender and traffic source never sit next to an individual
+   customer, never filter a list of customers, and are only shown aggregated.
 
 The rewritten SQL is what runs. In production the same guarantees are also
 enforced by BigQuery itself (authorized views + row-level access policies +
@@ -32,6 +37,7 @@ from sqlglot.errors import ParseError
 
 from ..identity import ProductScope
 from ..knowledge import DataDictionary
+from .aggregate_rule import AggregateOnlyRule
 
 DENIED_FUNCTION_PREFIXES = (
     "EXTERNAL_QUERY",
@@ -82,6 +88,7 @@ class SqlGuard:
                 live = {c.lower() for c in live_columns[name]}
                 cols = [c for c in cols if c.lower() in live]
             self.projection[name] = cols
+        self.aggregate_rule = AggregateOnlyRule(dictionary, project, dataset)
 
     # ------------------------------------------------------------------ public
 
@@ -91,9 +98,12 @@ class SqlGuard:
         self._check_functions(tree)
         self._check_pii(tree)
         tables = self._check_and_collect_tables(tree, cte_names)
-        rewritten = self._rewrite(tree, tables, cte_names, scope)
+        rewritten = self._rewrite(tree, tables, cte_names, scope).sql(dialect="bigquery")
+        problems = self.aggregate_rule.violations(rewritten)
+        if problems:
+            raise SqlRejected(problems[0][0], " ".join(message for _, message in problems))
         names = tuple(sorted({self._table_key(t) for t in tables}))
-        return GuardedQuery(original_sql=sql, sql=rewritten.sql(dialect="bigquery"), tables=names)
+        return GuardedQuery(original_sql=sql, sql=rewritten, tables=names)
 
     def fq_name(self, table: str) -> str:
         return f"`{self.project}.{self.dataset_name}.{table}`"
@@ -201,33 +211,35 @@ class SqlGuard:
         ]
         return exp.and_(*conds)
 
-    def _entitled_product_ids(self, scope: ProductScope) -> exp.Select:
-        return exp.select("id").from_(self._raw("products")).where(self._product_predicate(scope))
-
     def _scoped_select(self, table: str, scope: ProductScope) -> exp.Select:
-        select = exp.select(*self.projection[table]).from_(self._raw(table))
+        cols = self.projection[table]
         if scope.unrestricted:
-            return select
-        product_ids = self._entitled_product_ids(scope)
+            return exp.select(*cols).from_(self._raw(table))
+        raw = {t: self._raw(t).sql(dialect="bigquery") for t in self.allowed_tables}
+        predicate = self._product_predicate(scope).sql(dialect="bigquery")  # literals escaped by sqlglot
+        in_scope_products = f"SELECT id FROM {raw['products']} WHERE {predicate}"
         if table == "products":
-            return select.where(self._product_predicate(scope))
-        if table == "order_items":
-            return select.where(exp.column("product_id").isin(query=product_ids))
-        if table == "orders":
-            orders_in_scope = (
-                exp.select("order_id")
-                .from_(self._raw("order_items"))
-                .where(exp.column("product_id").isin(query=product_ids))
+            sql = f"SELECT {', '.join(cols)} FROM {raw['products']} WHERE {predicate}"
+        elif table == "order_items":
+            sql = f"SELECT {', '.join(cols)} FROM {raw['order_items']} WHERE product_id IN ({in_scope_products})"
+        elif table == "orders":
+            # Orders that contain in-scope items; num_of_item counts only those items, so an
+            # order does not reveal how many other brands' items it held.
+            projection = ", ".join("s.num_of_item AS num_of_item" if c == "num_of_item" else f"o.{c}" for c in cols)
+            sql = (
+                f"SELECT {projection} FROM {raw['orders']} AS o JOIN (SELECT order_id, COUNT(*) AS num_of_item "
+                f"FROM {raw['order_items']} WHERE product_id IN ({in_scope_products}) GROUP BY order_id) AS s "
+                "ON s.order_id = o.order_id"
             )
-            return select.where(exp.column("order_id").isin(query=orders_in_scope))
-        if table == "users":
-            buyers_in_scope = (
-                exp.select("user_id")
-                .from_(self._raw("order_items"))
-                .where(exp.column("product_id").isin(query=product_ids))
+        elif table == "users":
+            # Customers who bought in-scope products.
+            sql = (
+                f"SELECT {', '.join(cols)} FROM {raw['users']} WHERE id IN "
+                f"(SELECT user_id FROM {raw['order_items']} WHERE product_id IN ({in_scope_products}))"
             )
-            return select.where(exp.column("id").isin(query=buyers_in_scope))
-        raise SqlRejected("forbidden_table", f"No entitlement rule for table {table}.")
+        else:
+            raise SqlRejected("forbidden_table", f"No entitlement rule for table {table}.")
+        return sqlglot.parse_one(sql, read="bigquery")
 
 
 def _describe_parse_error(error: ParseError) -> str:

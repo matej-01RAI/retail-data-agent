@@ -5,10 +5,14 @@
 # entitlement service / IAM group mapping (docs/architecture.md, "Identity &
 # entitlements").
 #
-# scope: "all" or a set of product filters. Values within one dimension are
-# OR-ed, dimensions are AND-ed. Allowed dimensions: brand, category, department.
-# The filter is applied in code to every table the user queries (products,
-# order_items, orders, users), so the model cannot widen it.
+# scope: "all" or a set of product filters. OpsFleet confirmed managers are scoped
+# to their own brands, with the CEO seeing everything. Values within one dimension
+# are OR-ed, dimensions are AND-ed. Allowed dimensions: brand (used here),
+# category, department. The filter is applied in code to every table the user
+# queries: products and order_items directly, and orders and customers only
+# through purchases of in-scope products. The model cannot widen it.
+# Brand names must match products.brand exactly; `python -m retail_agent doctor`
+# checks that each scope matches products in the dataset.
 
 users:
   ceo:
@@ -18,12 +22,12 @@ users:
 
   maria:
     name: Maria
-    title: Head of Womenswear
+    title: Brand Manager, Calvin Klein and Tommy Hilfiger
     scope:
-      department: [Women]
+      brand: ["Calvin Klein", "Tommy Hilfiger"]
 
   tom:
     name: Tom
-    title: Category Manager, Jeans & Outerwear
+    title: Brand Manager, Levi's and Carhartt
     scope:
-      category: [Jeans, Outerwear & Coats]
+      brand: ["Levi's", "Carhartt"]

@@ -188,12 +188,22 @@ user's scope, and retrieval must map benchmark questions to the right trio.
 
 ## 4. Safety and PII masking
 
+**Rules confirmed by OpsFleet:**
+
+- First name, last name, email, street address, postal code and exact coordinates (and the
+  `user_geom` geometry) must never appear in output or reach the LLM.
+- City, state, country, age, gender and traffic source are fine, but **only in aggregates**.
+- Customers may be referenced by their internal `user_id` or a stable pseudonymous ID.
+- Each manager analyses only their own brands; the CEO sees everything.
+- Customer and order data are visible only through purchases of in-scope products.
+
 ### 4.1 Threat model
 
 | Threat | Example | Primary control |
 |---|---|---|
 | PII exfiltration | "List our top customers with emails", `SELECT email`, `WHERE email LIKE ...`, `TO_JSON_STRING(u)` | PII columns are not reachable: scoped views and policy tags (DB), guard rejects references (app) |
-| Cross-scope access | A category manager asks about another category, or the model "forgets" the filter | Scope applied in SQL by code (app) and by authorized views / row policies (DB) |
+| Re-identification via customer attributes | "Top customers and the state and age of each", "IDs of customers in Texas aged 67", `SELECT city FROM users` | Aggregate-only rule (app, below) and aggregation-threshold policies (DB) |
+| Cross-scope access | A brand manager asks about another brand, or the model "forgets" the filter | Scope applied in SQL by code (app) and by authorized views / row policies (DB) |
 | Writes / exfiltration via SQL | `DELETE`, `EXPORT DATA`, scripting, `EXTERNAL_QUERY`, other datasets | Guard: one read-only SELECT, allowlisted tables, denied functions; dry-run statement-type and referenced-table checks; read-only service account |
 | Direct prompt injection / jailbreak | "Ignore previous instructions...", role-play | Model Armor + deterministic rules; and nothing dangerous is callable anyway |
 | Indirect injection | A product name or report text containing instructions | Tool results are framed as data in the instructions; capabilities are bounded by code, not by obedience |
@@ -204,12 +214,23 @@ user's scope, and retrieval must map benchmark questions to the right trio.
 
 ### 4.2 Layered controls (production)
 
-1. **Identity and entitlements.** The user's identity comes from the IAP JWT. Their product scope
-   comes from the entitlement resolver (IdP groups -> scope), never from the conversation.
+1. **Identity and entitlements.** The user's identity comes from the IAP JWT. Their brand scope
+   comes from the entitlement resolver, never from the conversation. The resolver reads an
+   access table (`manager -> brands`, owned by the business, edited through the admin console);
+   executives with `scope = all` see everything.
 2. **Warehouse enforcement (independent of our code).**
    - The agent never queries raw tables. For each entitlement scope there is an **authorized
-     view** layer, e.g. `analytics_scoped_womenswear.order_items`, filtered to the scope's
-     products and **projecting no PII columns**.
+     view** layer, e.g. `analytics_scope_<id>.order_items`, filtered to the scope's brands and
+     **projecting no PII columns**. `orders` and `users` views expose only orders and customers
+     with in-scope purchases, and an order's item count includes only in-scope items.
+   - Customer attributes sit behind a view with BigQuery's **aggregation threshold analysis
+     rule** (privacy unit = customer id, threshold 5). BigQuery itself then rejects
+     non-aggregated reads of those columns and drops groups with fewer than 5 customers. This is
+     the database-level twin of the aggregate-only rule below, and it adds the minimum group size.
+   - Where a pseudonymous customer ID is preferred over `user_id`, the views expose
+     `customer_ref = SUBSTR(TO_HEX(SHA256(CONCAT(salt, CAST(id AS STRING)))), 1, 16)`, with the
+     salt held in Secret Manager. It is stable, so follow-ups still work, and the model never
+     sees the salt or the raw id.
    - PII columns in the raw tables carry **policy tags** (column-level security, optionally
      dynamic data masking). The agent's service accounts do not hold Fine-Grained Reader.
    - Each scope has its own service account, granted only its views. The Chat API mints a
@@ -225,15 +246,28 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    (`EXTERNAL_QUERY`, `ML.*`, `AI.*`, `VECTOR_SEARCH`, `KEYS.*`, `AEAD.*`, ...). Any reference to
    a PII column by name, anywhere (select, filter, order, join, subquery alias), is rejected with
    a message that tells the model what to use instead. Then it **rewrites** every table reference
-   to the scoped source. Rejections are fed back to the model, which usually corrects itself in
-   one step. Then, before running:
+   to the scoped source. Then it applies the **aggregate-only rule**: it qualifies the rewritten
+   query against the schema and traces every column to its base column through CTEs, derived
+   tables, set operations and scalar subqueries.
+   - **R1:** if the result has a row per customer (an un-aggregated customer key in the output),
+     the query may not use any customer attribute anywhere, as output or as a filter.
+   - **R2:** every customer attribute in the output must be aggregated across customers: inside
+     an aggregate function, or in a SELECT that groups or uses DISTINCT *without* grouping by a
+     customer key.
+   - **R3:** whole-row references (`TO_JSON_STRING(u)`, structs of a row) are rejected.
+
+   Anything untraceable in a query that touches customer attributes fails closed. Rejections are
+   fed back to the model with a fix-it message, and it usually corrects itself in one step (for
+   example, "top customers with their state" becomes a customer list plus a by-state aggregate).
+   Then, before running:
    - BigQuery **dry run**: statement type must be SELECT; referenced tables must be inside the
      dataset; estimated bytes must be within the cap.
    - Real run with `maximum_bytes_billed`, labels (user, session, turn) and a timeout.
 4. **Result handling.** At most N rows go to the model (the agent is told to aggregate in SQL).
    String cells pass the PII scrubber.
-   - **Small-cell suppression:** results grouped by quasi-identifiers (age, gender, city, state)
-     with fewer than 5 distinct customers in a group are suppressed or merged into "Other".
+   - **Small groups:** the aggregation threshold (above) removes groups of fewer than 5
+     customers. The prototype has no threshold; its rule guarantees aggregation, not a minimum
+     group size.
    - Ages are presented as bands.
 5. **Input guard.** Model Armor (prompt injection, jailbreak, malicious URLs) plus cheap
    deterministic rules. A blocked prompt gets a canned reply and **costs no model call**. PII the
@@ -255,13 +289,13 @@ reaches the model provider.
 
 | Layer | Prototype implementation |
 |---|---|
-| Identity / scope | `config/users.yaml` + `--user`; `ProductScope` passed via `Deps` |
-| Warehouse enforcement | Simulated by the guard's rewrite: every table becomes a subquery projecting only non-PII columns and filtered to the user's products (`orders` and `users` via semi-joins on in-scope order lines) |
-| Query guard | `data/sql_guard.py`; BigQuery dry-run checks in `data/warehouse.py` |
+| Identity / scope | `config/users.yaml` (the access table: CEO = all, brand managers = their brands) + `--user`; `ProductScope` passed via `Deps`; `doctor` checks every scope matches products |
+| Warehouse enforcement | Simulated by the guard's rewrite: every table becomes a subquery projecting only non-PII columns and filtered to the user's brands (`orders` and `users` only through in-scope order lines; `num_of_item` recounted over in-scope items) |
+| Query guard | `data/sql_guard.py`; aggregate-only rule in `data/aggregate_rule.py`; BigQuery dry-run checks in `data/warehouse.py` |
 | Result handling | Row cap (50), cell scrubbing (`agent.py`) |
 | Input guard | `safety/input_guard.py` (injection patterns, size cap, PII masking) |
 | Output guard | `safety/pii.py` on answers and saved reports (emails, phones, street addresses, Luhn-valid cards, IPs; tested against false positives on business numbers) |
-| Tests | `tests/test_sql_guard.py` (28 attack queries and 9 legitimate ones), `tests/test_safety_text.py`, end-to-end PII and scope tests in `tests/test_agent_flow.py` |
+| Tests | `tests/test_sql_guard.py` (42 rejected attack queries, 16 legitimate ones), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
 
 ---
 
@@ -477,7 +511,7 @@ background, compared offline), then a canary rollout with SLO monitoring.
 
 ### 8.3 Prototype
 
-145 offline tests (`pytest`): SQL-guard red team, text safety, golden-trio validation for every
+169 offline tests (`pytest`): SQL-guard red team, text safety, golden-trio validation for every
 scope, BigQuery dry-run and error classification against a fake runner, and 23 end-to-end agent flows with a scripted model (self-correction, give-up bounds, empty
 results, PII, scope, injection, deletion flows, outages, fallback, usage limits, persona,
 preferences, tracing). The eval harness against a live model (§8.1) is the next step. The golden
@@ -614,7 +648,7 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 |---|---|---|
 | Interface | Rich CLI | Web app (SSE) + Slack/Teams adapters over the Chat API |
 | Identity | `--user` from `config/users.yaml` | IAP / IdP SSO, entitlement service |
-| Data access | Guard rewrite to scoped subqueries; dry-run checks | Same guard **plus** per-scope SAs, authorized views, row policies, policy tags |
+| Data access | Guard rewrite to brand-scoped subqueries, aggregate-only rule, dry-run checks | Same guard **plus** per-scope SAs, authorized views, row policies, policy tags, aggregation-threshold views |
 | LLM | AI Studio API, `*-latest` aliases, retries, fallback, limiter | Vertex AI, pinned versions, same chain, quotas / provisioned throughput |
 | Golden knowledge | 12 YAML trios, BM25, CI validation | GCS bucket, ingest job, hybrid index, review queue, nightly re-validation |
 | State | SQLite (`.data/app.db`) | Cloud SQL Postgres, Firestore |
@@ -622,4 +656,4 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 | Observability | OTel -> JSONL, SQLite metrics, `/trace`, `/stats` | OTel -> Cloud Trace, logs -> BigQuery, Cloud Monitoring SLOs and alerts |
 | Persona | File, hot-reloaded | Firestore registry, admin console, preview, rollback |
 | Learning | Explicit preferences | Plus implicit preference proposals and the system-level loop |
-| Evaluation | 145 offline tests | Plus live eval harness, LLM judge, shadow and canary |
+| Evaluation | 169 offline tests | Plus live eval harness, LLM judge, shadow and canary |
