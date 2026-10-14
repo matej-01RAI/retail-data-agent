@@ -1,0 +1,112 @@
+# Semantic layer for bigquery-public-data.thelook_ecommerce.
+#
+# This file is the agent's source of truth about the data: what each column
+# means, which columns are PII (never selectable, never shown), the allowed
+# values of categorical columns and the business definitions analysts use.
+# It is versioned with the code and owned by the data team. In production it
+# lives next to the Golden Knowledge bucket and is refreshed by the same
+# pipeline (see docs/architecture.md, "Knowledge layer").
+
+dataset: bigquery-public-data.thelook_ecommerce
+
+tables:
+  orders:
+    description: One row per customer order (header level).
+    grain: order_id
+    columns:
+      order_id: {type: INT64, description: Order identifier (primary key).}
+      user_id: {type: INT64, description: Customer who placed the order (FK users.id). Pseudonymous key, not PII by itself.}
+      status: {type: STRING, description: Order status., values: [Processing, Shipped, Complete, Cancelled, Returned]}
+      gender: {type: STRING, description: Customer gender copied onto the order., values: [M, F]}
+      created_at: {type: TIMESTAMP, description: When the order was placed (UTC).}
+      returned_at: {type: TIMESTAMP, description: When the order was returned; NULL if not returned.}
+      shipped_at: {type: TIMESTAMP, description: When the order shipped; NULL if not shipped.}
+      delivered_at: {type: TIMESTAMP, description: When the order was delivered; NULL if not delivered.}
+      num_of_item: {type: INT64, description: Number of items in the order.}
+
+  order_items:
+    description: One row per item sold. The source of truth for revenue.
+    grain: id
+    columns:
+      id: {type: INT64, description: Order line identifier (primary key).}
+      order_id: {type: INT64, description: FK orders.order_id.}
+      user_id: {type: INT64, description: FK users.id.}
+      product_id: {type: INT64, description: FK products.id.}
+      inventory_item_id: {type: INT64, description: Physical inventory unit that was sold.}
+      status: {type: STRING, description: Line status., values: [Processing, Shipped, Complete, Cancelled, Returned]}
+      created_at: {type: TIMESTAMP, description: When the line was created (= order time, UTC).}
+      shipped_at: {type: TIMESTAMP, description: When the line shipped.}
+      delivered_at: {type: TIMESTAMP, description: When the line was delivered.}
+      returned_at: {type: TIMESTAMP, description: When the line was returned.}
+      sale_price: {type: FLOAT64, description: Price paid for this item in USD.}
+
+  products:
+    description: Product catalogue.
+    grain: id
+    columns:
+      id: {type: INT64, description: Product identifier (primary key).}
+      cost: {type: FLOAT64, description: Unit cost to the company in USD.}
+      category: {type: STRING, description: "Product category, e.g. Jeans, Dresses, Outerwear & Coats, Swim, Accessories."}
+      name: {type: STRING, description: Product name.}
+      brand: {type: STRING, description: Brand name.}
+      retail_price: {type: FLOAT64, description: List price in USD.}
+      department: {type: STRING, description: Department., values: [Men, Women]}
+      sku: {type: STRING, description: Stock keeping unit.}
+      distribution_center_id: {type: INT64, description: Distribution centre that stocks the product.}
+
+  users:
+    description: Customers. Contains PII; only the non-PII columns are available to the agent.
+    grain: id
+    columns:
+      id: {type: INT64, description: Customer identifier (pseudonymous key).}
+      first_name: {type: STRING, pii: true}
+      last_name: {type: STRING, pii: true}
+      email: {type: STRING, pii: true}
+      age: {type: INT64, description: Age in years. Prefer age bands in outputs.}
+      gender: {type: STRING, description: Gender., values: [M, F]}
+      state: {type: STRING, description: State / province / region.}
+      street_address: {type: STRING, pii: true}
+      postal_code: {type: STRING, pii: true}
+      city: {type: STRING, description: City.}
+      country: {type: STRING, description: Country name, e.g. United States, China, Brazil.}
+      latitude: {type: FLOAT64, pii: true}
+      longitude: {type: FLOAT64, pii: true}
+      traffic_source: {type: STRING, description: Acquisition channel., values: [Search, Organic, Facebook, Email, Display]}
+      created_at: {type: TIMESTAMP, description: When the customer signed up (UTC).}
+      user_geom: {type: GEOGRAPHY, pii: true}
+
+relationships:
+  - order_items.order_id = orders.order_id
+  - order_items.product_id = products.id
+  - order_items.user_id = users.id
+  - orders.user_id = users.id
+
+# Business definitions. When a question uses one of these terms, use this
+# definition and say so in the answer.
+metrics:
+  revenue: >-
+    SUM(order_items.sale_price) over lines whose status is NOT IN ('Cancelled', 'Returned').
+    Say "gross revenue" if you include them.
+  gross_margin: >-
+    SUM(order_items.sale_price - products.cost) over non-cancelled, non-returned lines;
+    margin % = gross_margin / revenue.
+  orders: COUNT(DISTINCT order_id) of orders that are not Cancelled.
+  average_order_value: revenue / orders.
+  active_customer: A customer with at least one non-cancelled order in the period.
+  spend_per_customer: >-
+    revenue / active customers. Decompose it as orders per customer x average order value
+    when explaining differences between segments.
+  return_rate: >-
+    Returned lines / lines that were shipped (status IN ('Shipped', 'Complete', 'Returned')).
+  churn: >-
+    A customer churns on the day 90 days after an order that is not followed by another order
+    within 90 days. Monthly churn rate = customers churning in the month / customers with an
+    order in the 90 days before the month started. Only months whose churn window has fully
+    elapsed are reliable.
+  new_vs_returning: A customer's first-ever non-cancelled order makes them "new" in that period.
+
+notes:
+  - All timestamps are UTC. Use DATE(created_at) for day-level grouping.
+  - The dataset is synthetic and keeps growing; check MIN/MAX(created_at) before answering
+    "last month" / "this year" questions and anchor them on CURRENT_DATE().
+  - Quarters are calendar quarters (Q1 = Jan-Mar) unless the user says otherwise.

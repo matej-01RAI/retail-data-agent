@@ -1,0 +1,10 @@
+# Python >= 3.11. Tested with the versions in the comments.
+pydantic-ai-slim[google]>=2.56,<3      # 2.56.0  agent framework + Gemini (google-genai 2.30.1)
+google-cloud-bigquery[pandas]>=3.46,<4 # 3.46.1  includes db-dtypes, needed by to_dataframe()
+pandas>=2.2                            # 3.0.6
+sqlglot>=30,<31                        # 30.22.0 SQL parsing / rewriting / transpiling
+duckdb>=1.5,<2                         # 1.5.6   offline mode only
+opentelemetry-sdk>=1.45,<2             # 1.45.1
+rich>=15,<16                           # 15.0.0
+PyYAML>=6,<7                           # 6.0.3
+python-dotenv>=1.2,<2                  # 1.2.4

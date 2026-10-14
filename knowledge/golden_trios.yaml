@@ -1,0 +1,334 @@
+# Golden Knowledge seed set: Question -> SQL -> Analyst report ("trios").
+#
+# The bucket is theoretical in the assignment, so these are authored for
+# thelook_ecommerce in the style a senior analyst would leave behind: the SQL
+# encodes the business definitions, and the report captures HOW the analyst
+# interpreted the question (decompositions, caveats, what to check next).
+# The agent retrieves the closest trios for each question and reuses their
+# logic. Every SQL here is validated by tests/test_golden_trios.py through the
+# SQL guard and the offline warehouse.
+#
+# In production these live as one JSON document per trio in the GCS Golden
+# bucket, with author, review status, version and embeddings; see
+# docs/architecture.md ("Golden Knowledge lifecycle").
+
+trios:
+  - id: GK-001
+    question: What is our monthly revenue trend over the last 12 months?
+    tags: [revenue, monthly, trend, time series, growth, aov, orders, month over month]
+    sql: |
+      SELECT
+        FORMAT_DATE('%Y-%m', DATE(oi.created_at)) AS month,
+        ROUND(SUM(oi.sale_price), 2) AS revenue,
+        COUNT(DISTINCT oi.order_id) AS orders,
+        ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT oi.order_id)), 2) AS avg_order_value
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+        AND DATE(oi.created_at) >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 12 MONTH)
+      GROUP BY month
+      ORDER BY month
+    report: >-
+      Revenue is net of cancelled and returned lines. The current month is partial: either
+      exclude it or compare month-to-date with the same days of the prior month, never a full
+      month. Explain changes as orders x average order value so the reader sees whether growth
+      came from more orders or bigger baskets. Q4 seasonality is strong, so compare with the
+      same month last year before calling a trend.
+
+  - id: GK-002
+    question: Who are our top customers and how much have they spent?
+    tags: [customers, top customers, total spend, lifetime value, ltv, best customers, vip]
+    sql: |
+      SELECT
+        oi.user_id AS customer_id,
+        u.country,
+        u.state,
+        CASE WHEN u.age < 25 THEN 'under 25' WHEN u.age < 35 THEN '25-34'
+             WHEN u.age < 50 THEN '35-49' ELSE '50+' END AS age_band,
+        COUNT(DISTINCT oi.order_id) AS orders,
+        ROUND(SUM(oi.sale_price), 2) AS total_spend
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+      GROUP BY customer_id, u.country, u.state, age_band
+      ORDER BY total_spend DESC
+      LIMIT 10
+    report: >-
+      Customers are identified by customer ID and described by non-personal attributes only
+      (country, state, age band); names and contact details are never reported. Put the list in
+      context: the top 10's share of total revenue shows how concentrated the business is, and
+      orders per top customer shows whether they are frequent buyers or one-off big baskets.
+
+  - id: GK-003
+    question: Why are users in Texas underspending compared to users in California?
+    tags: [state, underspending, spend per customer, compare segments, region, geography, why, frequency, basket]
+    sql: |
+      WITH customer_spend AS (
+        SELECT u.state, oi.user_id,
+               COUNT(DISTINCT oi.order_id) AS orders,
+               SUM(oi.sale_price) AS spend
+        FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+        JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+        WHERE oi.status NOT IN ('Cancelled', 'Returned')
+          AND u.state IN ('Texas', 'California')
+        GROUP BY u.state, oi.user_id
+      )
+      SELECT state,
+             COUNT(*) AS customers,
+             ROUND(AVG(spend), 2) AS spend_per_customer,
+             ROUND(AVG(orders), 2) AS orders_per_customer,
+             ROUND(SAFE_DIVIDE(SUM(spend), SUM(orders)), 2) AS avg_order_value
+      FROM customer_spend
+      GROUP BY state
+    report: >-
+      "Underspending" needs a baseline: compare both states with each other and with the national
+      average. Decompose spend per customer = orders per customer x average order value; that
+      tells you whether the gap is frequency (retention, engagement) or basket (price point,
+      category mix). Then check the mix behind the weaker factor: category and department mix,
+      traffic source, age band. Report the size of the gap in dollars per customer and in total.
+
+  - id: GK-004
+    question: Compare the performance of brand Calvin Klein and brand Columbia and explain why they perform differently.
+    tags: [brand, product, compare, performance, margin, return rate, price, units, why differently]
+    sql: |
+      SELECT
+        p.brand,
+        COUNTIF(oi.status NOT IN ('Cancelled', 'Returned')) AS units_sold,
+        ROUND(SUM(IF(oi.status NOT IN ('Cancelled', 'Returned'), oi.sale_price, 0)), 2) AS revenue,
+        ROUND(SAFE_DIVIDE(SUM(IF(oi.status NOT IN ('Cancelled', 'Returned'), oi.sale_price - p.cost, 0)),
+                          SUM(IF(oi.status NOT IN ('Cancelled', 'Returned'), oi.sale_price, 0))), 3) AS margin_pct,
+        ROUND(SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'),
+                          COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned'))), 3) AS return_rate,
+        ROUND(AVG(oi.sale_price), 2) AS avg_selling_price,
+        COUNT(DISTINCT oi.user_id) AS customers,
+        COUNT(DISTINCT p.id) AS products_sold
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+      WHERE p.brand IN ('Calvin Klein', 'Columbia')
+      GROUP BY p.brand
+    report: >-
+      Compare like with like: revenue alone favours the brand with more products or higher prices.
+      Break the gap into units x average selling price, then look at margin % and return rate
+      (returns destroy margin and signal fit/quality issues). If assortment size differs, compare
+      revenue per product. A follow-up query by category within each brand usually explains most
+      of the difference (e.g. one brand sells mostly outerwear at high price points).
+
+  - id: GK-005
+    question: Which product categories grew or declined last quarter compared to the quarter before?
+    tags: [category, quarter, growth, decline, qoq, quarter over quarter, product performance, margin]
+    sql: |
+      WITH base AS (
+        SELECT p.category,
+               DATE_TRUNC(DATE(oi.created_at), QUARTER) AS quarter,
+               oi.sale_price,
+               oi.sale_price - p.cost AS margin
+        FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+        JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+        WHERE oi.status NOT IN ('Cancelled', 'Returned')
+          AND DATE(oi.created_at) >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 2 QUARTER)
+          AND DATE(oi.created_at) < DATE_TRUNC(CURRENT_DATE(), QUARTER)
+      )
+      SELECT category,
+             ROUND(SUM(IF(quarter = DATE_SUB(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 1 QUARTER), sale_price, 0)), 2) AS revenue_last_quarter,
+             ROUND(SUM(IF(quarter = DATE_SUB(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 2 QUARTER), sale_price, 0)), 2) AS revenue_prior_quarter,
+             ROUND(SAFE_DIVIDE(
+               SUM(IF(quarter = DATE_SUB(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 1 QUARTER), sale_price, 0)),
+               SUM(IF(quarter = DATE_SUB(DATE_TRUNC(CURRENT_DATE(), QUARTER), INTERVAL 2 QUARTER), sale_price, 0))) - 1, 3) AS growth,
+             ROUND(SAFE_DIVIDE(SUM(margin), SUM(sale_price)), 3) AS margin_pct
+      FROM base
+      GROUP BY category
+      ORDER BY growth DESC
+    report: >-
+      Use complete quarters only. Rank by growth but also show absolute revenue: +40% on a tiny
+      category matters less than -5% on the largest one. Seasonal categories (Swim, Outerwear)
+      swing between quarters, so check the same quarter last year before calling a decline.
+
+  - id: GK-006
+    question: Why did our churn rate spike last month?
+    tags: [churn, retention, spike, customers lost, repeat purchase, monthly churn, why]
+    sql: |
+      WITH customer_orders AS (
+        SELECT user_id, DATE(created_at) AS order_date
+        FROM `bigquery-public-data.thelook_ecommerce.orders`
+        WHERE status != 'Cancelled'
+      ),
+      gaps AS (
+        SELECT user_id, order_date,
+               LEAD(order_date) OVER (PARTITION BY user_id ORDER BY order_date) AS next_order_date
+        FROM customer_orders
+      ),
+      churn_events AS (
+        SELECT user_id, DATE_ADD(order_date, INTERVAL 90 DAY) AS churn_date
+        FROM gaps
+        WHERE (next_order_date IS NULL OR DATE_DIFF(next_order_date, order_date, DAY) > 90)
+          AND DATE_ADD(order_date, INTERVAL 90 DAY) <= CURRENT_DATE()
+      ),
+      months AS (
+        SELECT month
+        FROM UNNEST(GENERATE_DATE_ARRAY(
+          DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 12 MONTH),
+          DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 MONTH),
+          INTERVAL 1 MONTH)) AS month
+      ),
+      active_base AS (
+        SELECT m.month, COUNT(DISTINCT o.user_id) AS active_customers
+        FROM months AS m
+        JOIN customer_orders AS o
+          ON o.order_date >= DATE_SUB(m.month, INTERVAL 90 DAY) AND o.order_date < m.month
+        GROUP BY m.month
+      ),
+      churned AS (
+        SELECT DATE_TRUNC(churn_date, MONTH) AS month, COUNT(DISTINCT user_id) AS churned_customers
+        FROM churn_events
+        GROUP BY month
+      )
+      SELECT FORMAT_DATE('%Y-%m', a.month) AS month,
+             a.active_customers,
+             IFNULL(c.churned_customers, 0) AS churned_customers,
+             ROUND(SAFE_DIVIDE(IFNULL(c.churned_customers, 0), a.active_customers), 3) AS churn_rate
+      FROM active_base AS a
+      LEFT JOIN churned AS c ON c.month = a.month
+      ORDER BY a.month
+    report: >-
+      Churn uses the 90-day definition from the data dictionary, so last month's churners are
+      customers whose last order was about 90 days earlier. A spike therefore usually points back
+      to the cohort that bought ~3 months ago: check whether that cohort was unusually large or
+      unusual (a promotion or channel that brings one-off buyers, e.g. traffic_source mix), and
+      whether their first-order experience was worse (return rate, delivery time). Say clearly
+      which months are complete; the most recent months are not.
+
+  - id: GK-007
+    question: Which categories have the highest return rates?
+    tags: [returns, return rate, category, quality, fit, refunds]
+    sql: |
+      SELECT p.category,
+             COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned')) AS shipped_items,
+             COUNTIF(oi.status = 'Returned') AS returned_items,
+             ROUND(SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'),
+                               COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned'))), 3) AS return_rate,
+             ROUND(SUM(IF(oi.status = 'Returned', oi.sale_price, 0)), 2) AS returned_revenue
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+      GROUP BY p.category
+      HAVING shipped_items >= 50
+      ORDER BY return_rate DESC
+    report: >-
+      Return rate is returned / shipped items (cancelled and processing lines never shipped).
+      Ignore categories with small volumes (the HAVING clause). Pair the rate with returned
+      revenue: the action priority is where both are high. Apparel fit categories (jeans,
+      dresses, swim) typically lead; size guides and fit notes are the usual levers.
+
+  - id: GK-008
+    question: Which marketing channels bring the most valuable customers?
+    tags: [traffic source, channel, acquisition, marketing, customers, revenue per customer, facebook, search, email]
+    sql: |
+      SELECT u.traffic_source,
+             COUNT(DISTINCT u.id) AS customers,
+             COUNT(DISTINCT oi.order_id) AS orders,
+             ROUND(SUM(oi.sale_price), 2) AS revenue,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT u.id)), 2) AS revenue_per_customer,
+             ROUND(SAFE_DIVIDE(COUNT(DISTINCT oi.order_id), COUNT(DISTINCT u.id)), 2) AS orders_per_customer
+      FROM `bigquery-public-data.thelook_ecommerce.users` AS u
+      JOIN `bigquery-public-data.thelook_ecommerce.order_items` AS oi ON oi.user_id = u.id
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+      GROUP BY u.traffic_source
+      ORDER BY revenue DESC
+    report: >-
+      Volume and value differ: Search usually brings most customers, while smaller channels can
+      bring higher revenue per customer. We have no marketing spend data, so do not claim ROI;
+      recommend joining spend data before reallocating budget.
+
+  - id: GK-009
+    question: Create a Q1 report including insights and action items for Q2.
+    tags: [report, quarterly, q1, q2, qbr, business review, kpis, insights, action items, executive summary]
+    sql: |
+      WITH lines AS (
+        SELECT DATE_TRUNC(DATE(oi.created_at), QUARTER) AS quarter,
+               oi.order_id, oi.user_id, oi.sale_price, p.cost
+        FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+        JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
+        WHERE oi.status NOT IN ('Cancelled', 'Returned')
+      ),
+      first_purchase AS (
+        SELECT user_id, MIN(quarter) AS first_quarter
+        FROM lines
+        GROUP BY user_id
+      )
+      SELECT CONCAT(CAST(EXTRACT(YEAR FROM l.quarter) AS STRING), '-Q',
+                    CAST(EXTRACT(QUARTER FROM l.quarter) AS STRING)) AS quarter,
+             ROUND(SUM(l.sale_price), 2) AS revenue,
+             ROUND(SAFE_DIVIDE(SUM(l.sale_price - l.cost), SUM(l.sale_price)), 3) AS margin_pct,
+             COUNT(DISTINCT l.order_id) AS orders,
+             COUNT(DISTINCT l.user_id) AS customers,
+             COUNT(DISTINCT IF(f.first_quarter = l.quarter, l.user_id, NULL)) AS new_customers,
+             ROUND(SAFE_DIVIDE(SUM(l.sale_price), COUNT(DISTINCT l.order_id)), 2) AS avg_order_value
+      FROM lines AS l
+      JOIN first_purchase AS f ON f.user_id = l.user_id
+      WHERE l.quarter IN (
+        DATE_TRUNC(CURRENT_DATE(), YEAR),
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), YEAR), INTERVAL 1 QUARTER),
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), YEAR), INTERVAL 1 YEAR))
+      GROUP BY l.quarter
+      ORDER BY l.quarter
+    report: >-
+      A quarterly report compares the quarter with the previous quarter (momentum) AND the same
+      quarter last year (seasonality-adjusted growth). Structure: executive summary (3 bullets),
+      KPI table (revenue, margin %, orders, customers, new customers, AOV), what drove the change
+      (category and channel follow-up queries), risks (returns, churn), and 3-5 action items for
+      the next quarter, each with an owner function, a metric to move and a target. Keep every
+      number traceable to a query.
+
+  - id: GK-010
+    question: How does spending differ by age group and gender?
+    tags: [demographics, age, gender, segments, spend, customers]
+    sql: |
+      SELECT CASE WHEN u.age < 25 THEN 'under 25' WHEN u.age < 35 THEN '25-34'
+                  WHEN u.age < 50 THEN '35-49' ELSE '50+' END AS age_band,
+             u.gender,
+             COUNT(DISTINCT u.id) AS customers,
+             ROUND(SUM(oi.sale_price), 2) AS revenue,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT u.id)), 2) AS spend_per_customer
+      FROM `bigquery-public-data.thelook_ecommerce.users` AS u
+      JOIN `bigquery-public-data.thelook_ecommerce.order_items` AS oi ON oi.user_id = u.id
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+      GROUP BY age_band, u.gender
+      ORDER BY age_band, u.gender
+    report: >-
+      Always use age bands, never single ages (small groups can identify people). Read both the
+      revenue share and spend per customer: a segment can be large but low-value. Department mix
+      (Men/Women) explains most gender differences, so check it before attributing behaviour.
+
+  - id: GK-011
+    question: How fast do we ship and deliver orders, and does delivery time affect returns?
+    tags: [fulfilment, shipping, delivery time, logistics, operations, returns, days to deliver]
+    sql: |
+      SELECT FORMAT_DATE('%Y-%m', DATE(created_at)) AS month,
+             ROUND(AVG(TIMESTAMP_DIFF(shipped_at, created_at, HOUR)) / 24, 2) AS avg_days_to_ship,
+             ROUND(AVG(TIMESTAMP_DIFF(delivered_at, shipped_at, HOUR)) / 24, 2) AS avg_days_in_transit,
+             ROUND(SAFE_DIVIDE(COUNTIF(status = 'Returned'), COUNTIF(delivered_at IS NOT NULL)), 3) AS return_rate_of_delivered
+      FROM `bigquery-public-data.thelook_ecommerce.orders`
+      WHERE DATE(created_at) >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 6 MONTH)
+      GROUP BY month
+      ORDER BY month
+    report: >-
+      Measure ship time from order to shipment and transit from shipment to delivery separately:
+      they have different owners (warehouse vs carrier). Correlation with returns over a few
+      months is weak evidence; say so, and suggest a cohort comparison (fast vs slow deliveries).
+
+  - id: GK-012
+    question: What data do we have and what can we analyse with it?
+    tags: [data available, schema, tables, overview, what can we do, database structure, date range]
+    sql: |
+      SELECT 'orders' AS table_name, COUNT(*) AS row_count,
+             MIN(created_at) AS first_record, MAX(created_at) AS last_record
+      FROM `bigquery-public-data.thelook_ecommerce.orders`
+      UNION ALL
+      SELECT 'order_items', COUNT(*), MIN(created_at), MAX(created_at)
+      FROM `bigquery-public-data.thelook_ecommerce.order_items`
+      UNION ALL
+      SELECT 'users', COUNT(*), MIN(created_at), MAX(created_at)
+      FROM `bigquery-public-data.thelook_ecommerce.users`
+    report: >-
+      Answer from the data dictionary first (tables, what each row is, how they join, which
+      fields are restricted as personal data), then add volumes and the date range from this
+      query. Close with 4-5 example questions the executive can ask next (revenue trends, customer
+      segments, product and brand performance, returns, retention).

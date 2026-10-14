@@ -1,0 +1,29 @@
+# Demo identities and their data entitlements.
+#
+# The CLI has no login: `--user <id>` picks one of these. In production the
+# identity comes from the IdP (signed JWT) and the entitlements from an
+# entitlement service / IAM group mapping (docs/architecture.md, "Identity &
+# entitlements").
+#
+# scope: "all" or a set of product filters. Values within one dimension are
+# OR-ed, dimensions are AND-ed. Allowed dimensions: brand, category, department.
+# The filter is applied in code to every table the user queries (products,
+# order_items, orders, users), so the model cannot widen it.
+
+users:
+  ceo:
+    name: Dana
+    title: Chief Executive Officer
+    scope: all
+
+  maria:
+    name: Maria
+    title: Head of Womenswear
+    scope:
+      department: [Women]
+
+  tom:
+    name: Tom
+    title: Category Manager, Jeans & Outerwear
+    scope:
+      category: [Jeans, Outerwear & Coats]
