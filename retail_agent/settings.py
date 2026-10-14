@@ -78,9 +78,27 @@ class Settings:
         return self.config_dir / "users.yaml"
 
 
+def _service_account_from_env(data_dir: Path) -> None:
+    """Support credentials passed as an env var (CI, cloud sandboxes) instead of a key file.
+
+    If GCP_SA_KEY_JSON holds a service-account key and GOOGLE_APPLICATION_CREDENTIALS is
+    not set, write the key to a private file under DATA_DIR and point ADC at it.
+    """
+    raw = os.getenv("GCP_SA_KEY_JSON")
+    if not raw or os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    path = data_dir / "gcp-service-account.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
+    path.write_text(raw)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
+
+
 def load_settings(env_file: str | None = None) -> Settings:
     load_dotenv(env_file or ROOT / ".env", override=False)
     data_dir = Path(os.getenv("DATA_DIR", ROOT / ".data"))
+    _service_account_from_env(data_dir)
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
         # Aliases keep the prototype working as Google rotates model versions.
