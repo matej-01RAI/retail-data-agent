@@ -67,6 +67,8 @@ def build(path: Path, *, users: int = 4000, seed: int = 7, start: date = date(20
     end = end or date.today()
     span_days = (end - start).days
     t0 = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    # Nothing happens after this moment: now when the data ends today, else the end of `end`.
+    horizon = min(datetime.now(timezone.utc), datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1))
 
     products = []
     pid = 0
@@ -93,7 +95,7 @@ def build(path: Path, *, users: int = 4000, seed: int = 7, start: date = date(20
         country, state, city, _, freq = rng.choices(GEO, weights=geo_weights)[0]
         gender = rng.choice("MF")
         first, last = rng.choice(FIRST), rng.choice(LAST)
-        signup = t0 + timedelta(days=rng.uniform(0, span_days), hours=rng.uniform(0, 24))
+        signup = min(t0 + timedelta(days=rng.uniform(0, span_days), hours=rng.uniform(0, 24)), horizon)
         user_rows.append({
             "id": uid, "first_name": first, "last_name": last,
             "email": f"{first.lower()}.{last.lower()}{uid}@example.com", "age": rng.randint(12, 70),
@@ -109,7 +111,7 @@ def build(path: Path, *, users: int = 4000, seed: int = 7, start: date = date(20
         dept = "Women" if gender == "F" else "Men"
         for _ in range(n_orders):
             when = when + timedelta(days=rng.expovariate(1 / 75), hours=rng.uniform(0, 24))
-            if when.date() > end:
+            if when > horizon:
                 break
             order_id += 1
             age_days = (end - when.date()).days
@@ -126,6 +128,13 @@ def build(path: Path, *, users: int = 4000, seed: int = 7, start: date = date(20
             shipped = when + timedelta(hours=rng.uniform(6, 72)) if status in ("Shipped", "Complete", "Returned") else None
             delivered = shipped + timedelta(days=rng.uniform(1, 6)) if shipped and status in ("Complete", "Returned") else None
             returned = delivered + timedelta(days=rng.uniform(1, 12)) if delivered and status == "Returned" else None
+            # An order is only as far along as the clock allows: no event after the horizon.
+            if returned and returned > horizon:
+                status, returned = "Complete", None
+            if delivered and delivered > horizon:
+                status, delivered = "Shipped", None
+            if shipped and shipped > horizon:
+                status, shipped = "Processing", None
             order_rows.append({
                 "order_id": order_id, "user_id": uid, "status": status, "gender": gender,
                 "created_at": _ts(when), "returned_at": _ts(returned) if returned else None,

@@ -94,20 +94,25 @@ metrics:
   gross_margin: >-
     SUM(order_items.sale_price - products.cost) over non-cancelled, non-returned lines;
     margin % = gross_margin / revenue.
-  orders: COUNT(DISTINCT order_id) of orders that are not Cancelled.
-  average_order_value: revenue / orders.
-  active_customer: A customer with at least one non-cancelled order in the period.
+  orders: >-
+    COUNT(DISTINCT order_id) over the same lines as revenue (status NOT IN ('Cancelled', 'Returned')),
+    so that average order value is consistent.
+  average_order_value: revenue / orders (both over the same lines).
+  active_customer: A customer with revenue in the period (at least one line not Cancelled or Returned).
   spend_per_customer: >-
     revenue / active customers. Decompose it as orders per customer x average order value
     when explaining differences between segments.
   return_rate: >-
-    Returned lines / lines that were shipped (status IN ('Shipped', 'Complete', 'Returned')).
+    Returned / delivered, where delivered = status IN ('Complete', 'Returned'). Lines (or orders)
+    still Processing or Shipped cannot have been returned yet, so they are left out of both.
   churn: >-
     A customer churns on the day 90 days after an order that is not followed by another order
     within 90 days. Monthly churn rate = customers churning in the month / customers with an
     order in the 90 days before the month started. Only months whose churn window has fully
     elapsed are reliable.
-  new_vs_returning: A customer's first-ever non-cancelled order makes them "new" in that period.
+  new_vs_returning: >-
+    A customer is "new" in the period of their first-ever order that is not Cancelled (returned
+    orders count: the customer did buy), and "returning" in later periods.
 
 notes:
   - All timestamps are UTC. Use DATE(created_at) for day-level grouping.
