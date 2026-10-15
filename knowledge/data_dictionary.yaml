@@ -5,7 +5,7 @@
 # values of categorical columns and the business definitions analysts use.
 # It is versioned with the code and owned by the data team. In production it
 # lives next to the Golden Knowledge bucket and is refreshed by the same
-# pipeline (see docs/architecture.md, "Knowledge layer").
+# pipeline (see docs/technical-design.md §3 and docs/architecture.md §2b).
 
 dataset: bigquery-public-data.thelook_ecommerce
 

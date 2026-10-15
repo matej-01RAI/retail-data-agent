@@ -52,7 +52,7 @@ configurable in `.env`.
 The requirements are mostly about *control*: approvals, bounded retries, budgets, fallbacks,
 identity-aware tools and tracing. Pydantic AI provides each of these as a first-class primitive
 (see the README for the mapping and the alternatives considered). It is model-agnostic, and its
-`FunctionModel` makes the agent loop testable without an LLM. The prototype's 23 end-to-end tests
+`FunctionModel` makes the agent loop testable without an LLM. The prototype's 32 end-to-end tests
 rely on that.
 
 ### Other components
@@ -245,29 +245,46 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    table-valued functions, and a denylist of functions that reach outside the dataset
    (`EXTERNAL_QUERY`, `ML.*`, `AI.*`, `VECTOR_SEARCH`, `KEYS.*`, `AEAD.*`, ...). Any reference to
    a PII column by name, anywhere (select, filter, order, join, subquery alias), is rejected with
-   a message that tells the model what to use instead. Then it **rewrites** every table reference
-   to the scoped source. Then it applies the **aggregate-only rule**: it qualifies the rewritten
-   query against the schema and traces every column to its base column through CTEs, derived
-   tables, set operations and scalar subqueries.
-   - **R1:** if the result has a row per customer (an un-aggregated customer key in the output),
-     the query may not use any customer attribute anywhere, as output or as a filter.
-   - **R2:** every customer attribute in the output must be aggregated across customers: inside
-     an aggregate function, or in a SELECT that groups or uses DISTINCT *without* grouping by a
-     customer key.
-   - **R3:** whole-row references (`TO_JSON_STRING(u)`, structs of a row) are rejected.
+   a message that tells the model what to use instead. A CTE may not take a table's name (it
+   would hide the real table from the rewrite), and user-defined or qualified functions are
+   rejected. Then it applies the **aggregate-only rule**: it qualifies the query against the
+   safe schema (stars expand to non-PII columns) and traces every column to its base column
+   through CTEs, derived tables, set operations, UNNEST and subqueries. A query that never
+   reaches a customer attribute runs as written: customer lists by `user_id` with purchase
+   metrics are allowed. A query that uses one anywhere (output, filter, join, group, order):
+   - **A1:** may not pack many customers or a whole record into one value: no `ARRAY_AGG`,
+     `STRING_AGG`, `ARRAY(...)`, `STRUCT`, `TO_JSON_STRING`, `FORMAT`, `SELECT AS STRUCT`,
+     aggregates outside an allowlist (one quantile, such as the median, is fine), or functions the
+     parser does not recognise. Whole-row
+     references are rejected in every query.
+   - **A2:** uses customer IDs only to join (`u.id = oi.user_id`, `user_id IN (SELECT ...)`), to
+     count (`COUNT(DISTINCT user_id)`) or to group a per-customer CTE. Never compared with a
+     value, computed with or listed, so "customer 35's state" cannot be asked for.
+   - **A3:** uses a per-customer subquery as a table (or `user_id IN (...)`), never as a scalar or
+     `EXISTS` subquery, because only a table's customers can be counted.
+   - **A4:** releases its result only through aggregation across customers: the final output is
+     never one row per customer, order or anything finer.
+   - **A5:** every aggregating SELECT that is not grouped by a customer ID gets
+     `HAVING COUNT(DISTINCT <customer id>) >= 5` **injected into the SQL that runs**, for every
+     set of customers it reads (tables joined on customer ID by an inner join count once; a
+     derived table that drops the customer ID is rejected). Smaller groups disappear, and the
+     model is told so it can mention a missing segment.
 
-   Anything untraceable in a query that touches customer attributes fails closed. Rejections are
-   fed back to the model with a fix-it message, and it usually corrects itself in one step (for
-   example, "top customers with their state" becomes a customer list plus a by-state aggregate).
+   Anything untraceable in such a query (recursive CTEs, PIVOT, unqualified names) fails closed,
+   and so does any crash in the checker. Rejections are fed back to the model with a fix-it
+   message, and it usually corrects itself in one step (for example, "top customers with their
+   state" becomes a customer list plus a by-state aggregate). What a threshold cannot stop is
+   differencing two large aggregates; production adds BigQuery's aggregation threshold (above),
+   and differential privacy where that matters.
    Then, before running:
    - BigQuery **dry run**: statement type must be SELECT; referenced tables must be inside the
      dataset; estimated bytes must be within the cap.
    - Real run with `maximum_bytes_billed`, labels (user, session, turn) and a timeout.
 4. **Result handling.** At most N rows go to the model (the agent is told to aggregate in SQL).
    String cells pass the PII scrubber.
-   - **Small groups:** the aggregation threshold (above) removes groups of fewer than 5
-     customers. The prototype has no threshold; its rule guarantees aggregation, not a minimum
-     group size.
+   - **Small groups:** groups of fewer than 5 customers are removed twice over: by the guard's
+     injected `HAVING` (prototype and production) and by the aggregation threshold (production).
+   - Cells that hold arrays or structs are converted and scrubbed element by element.
    - Ages are presented as bands.
 5. **Input guard.** Model Armor (prompt injection, jailbreak, malicious URLs) plus cheap
    deterministic rules. A blocked prompt gets a canned reply and **costs no model call**. PII the
@@ -280,7 +297,8 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    (EMAIL_ADDRESS, PHONE_NUMBER, PERSON_NAME, STREET_ADDRESS, CREDIT_CARD_NUMBER...). If DLP is
    unavailable it **fails closed** to the deterministic scrubber; it never skips scrubbing.
 8. **Logs and traces.** They contain masked inputs and PII-free data by construction, are scrubbed
-   again before export, and are retained for limited periods (architecture.md §8).
+   again before export, and are retained for limited periods (architecture.md §8). The prototype
+   scrubs the stored messages, SQL events and every span attribute before writing them.
 
 The key property: **the model never sees PII**, so it cannot leak it, and personal data never
 reaches the model provider.
@@ -291,11 +309,11 @@ reaches the model provider.
 |---|---|
 | Identity / scope | `config/users.yaml` (the access table: CEO = all, brand managers = their brands) + `--user`; `ProductScope` passed via `Deps`; `doctor` checks every scope matches products |
 | Warehouse enforcement | Simulated by the guard's rewrite: every table becomes a subquery projecting only non-PII columns and filtered to the user's brands (`orders` and `users` only through in-scope order lines; `num_of_item` recounted over in-scope items) |
-| Query guard | `data/sql_guard.py`; aggregate-only rule in `data/aggregate_rule.py`; BigQuery dry-run checks in `data/warehouse.py` |
-| Result handling | Row cap (50), cell scrubbing (`agent.py`) |
+| Query guard | `data/sql_guard.py`; aggregate-only rule and group-size injection in `data/aggregate_rule.py`; BigQuery dry-run checks in `data/warehouse.py` |
+| Result handling | Row cap (50), cell scrubbing including arrays and structs (`agent.py`) |
 | Input guard | `safety/input_guard.py` (injection patterns, size cap, PII masking) |
 | Output guard | `safety/pii.py` on answers and saved reports (emails, phones, street addresses, Luhn-valid cards, IPs; tested against false positives on business numbers) |
-| Tests | `tests/test_sql_guard.py` (42 rejected attack queries, 16 legitimate ones), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
+| Tests | `tests/test_sql_guard.py` (about 90 rejected attack queries, every bypass found in review among them; 24 legitimate ones; small groups dropped on real data), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
 
 ---
 
@@ -409,7 +427,8 @@ after the eval gate (§8), with a canary and one-click rollback. The system impr
 | Guard rejection (PII, DML, other table) | `SqlRejected(kind, message)` | `ModelRetry` with a fix-it message; counts as a failed attempt |
 | Syntax / semantic error | Dry run / BigQuery `BadRequest` -> `invalid_sql` | Error message back to the model (`ModelRetry`) |
 | Over the bytes cap | Dry-run estimate or `bytesBilledLimitExceeded` -> `too_expensive` | Back to the model: narrow columns or dates |
-| Empty result | `row_count == 0` | Back to the model once: check spellings, statuses, date range, scope. If zero is genuinely right it re-runs with `allow_empty=true` |
+| Empty result | `row_count == 0` | Back to the model: check spellings, statuses, date range, scope (and that small groups are hidden). It counts as a failed attempt; if zero is genuinely right the model re-runs with `allow_empty=true` |
+| Query ran out of time | The query used its whole time budget -> `timeout` | Back to the model to aggregate more or narrow dates. **Not retried** (a retry would bill the same heavy query again) and not counted as an outage |
 | 3 consecutive failures | `TurnStats.consecutive_sql_failures` | `ToolFailed`: stop querying, explain what was tried, suggest a rephrase. Further calls are refused **without touching the warehouse** |
 | Query budget used (10 / question) | Counter | `ToolFailed`: answer with what you have |
 
@@ -423,7 +442,7 @@ cheap calls, never an unbounded loop.
 | Gemini | Invalid key, unknown model, permission (4xx from every model) | `llm_config_error`: "configuration problem, retrying won't help"; alert. Not reported as an outage |
 | Gemini | 429, 5xx, timeout | SDK retries with exponential backoff and jitter (3 attempts) -> **fallback model** (Flash-Lite, separate quota) -> friendly "AI service unavailable, your conversation is kept" message. A client-side **rate limiter** keeps multi-call turns under the per-minute quota in the first place. |
 | Gemini | Malformed tool call, runaway loop | Framework validation retries (bounded); `UsageLimits` (model calls, tokens per question); turn timeout |
-| BigQuery | 5xx, 429, rate limit, timeout | Typed as `unavailable`; retried 3x with jittered backoff; **circuit breaker** opens after repeated failures (fails fast for 30 s, then probes); the model is told *not* to retry or guess numbers and to tell the user |
+| BigQuery | 5xx, 429, rate limit, network timeout | Typed as `unavailable`; up to 3 attempts with jittered backoff; **circuit breaker** opens after repeated failures (fails fast for 30 s, then probes); the model is told *not* to retry or guess numbers and to tell the user |
 | BigQuery | Permission / quota / billing | Typed `permission`, terminal, clear message; alert |
 | Golden index / embeddings | Down | Proceed without precedents (the semantic layer is still present); flag on the turn |
 | Model Armor | Down | Deterministic input rules still apply; alert. The data boundary does not depend on it |
@@ -433,10 +452,15 @@ cheap calls, never an unbounded loop.
 ### 7.3 Never crash the UI
 
 The turn loop (`assistant.py`) maps every exception class to an outcome (`limit`, `timeout`,
-`llm_unavailable`, `llm_config_error`, `model_error`, `error`) and a plain-language message. The conversation history
-advances **only on completed turns**, so after any failure the user can simply retry. Human
-confirmation time is excluded from the turn timeout. Every outcome, including failures, is
-recorded with its error type and trace id.
+`llm_unavailable`, `llm_config_error`, `model_error`, `interrupted`, `error`) and a
+plain-language message. The conversation history advances **only on completed turns**, so after
+any failure the user can simply retry, with one exception: if the turn already changed something
+(a confirmed deletion, a saved report), the reply says so and the history records it, so the user
+is never told "something went wrong" about a deletion that happened. After the user confirms an
+action, the resumed run always has a few model calls of headroom to report it. Tools still running
+in a worker thread when a turn ends start no new query and change nothing. Human confirmation
+time is excluded from the turn timeout. Telemetry writes are best effort and never end a turn.
+Every outcome, including failures, is recorded with its error type and trace id.
 
 ### 7.4 Cost controls (summary)
 
@@ -511,10 +535,12 @@ background, compared offline), then a canary rollout with SLO monitoring.
 
 ### 8.3 Prototype
 
-169 offline tests (`pytest`): SQL-guard red team, text safety, golden-trio validation for every
-scope, BigQuery dry-run and error classification against a fake runner, and 23 end-to-end agent flows with a scripted model (self-correction, give-up bounds, empty
-results, PII, scope, injection, deletion flows, outages, fallback, usage limits, persona,
-preferences, tracing). The eval harness against a live model (§8.1) is the next step. The golden
+About 275 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
+text safety, golden-trio validation for every scope, BigQuery dry-run and error classification
+against a fake runner, settings and CLI commands, and 32 end-to-end agent flows with a scripted
+model (self-correction, give-up bounds, empty results, PII, scope, injection, deletion flows,
+side effects reported after a failure, outages, fallback, usage limits, persona, preferences,
+tracing, scrubbed telemetry). The eval harness against a live model (§8.1) is the next step. The golden
 trios already provide reference SQL for execution accuracy.
 
 ---
@@ -648,7 +674,7 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 |---|---|---|
 | Interface | Rich CLI | Web app (SSE) + Slack/Teams adapters over the Chat API |
 | Identity | `--user` from `config/users.yaml` | IAP / IdP SSO, entitlement service |
-| Data access | Guard rewrite to brand-scoped subqueries, aggregate-only rule, dry-run checks | Same guard **plus** per-scope SAs, authorized views, row policies, policy tags, aggregation-threshold views |
+| Data access | Guard rewrite to brand-scoped subqueries, aggregate-only rule with a 5-customer minimum, dry-run checks | Same guard **plus** per-scope SAs, authorized views, row policies, policy tags, aggregation-threshold views |
 | LLM | AI Studio API, `*-latest` aliases, retries, fallback, limiter | Vertex AI, pinned versions, same chain, quotas / provisioned throughput |
 | Golden knowledge | 12 YAML trios, BM25, CI validation | GCS bucket, ingest job, hybrid index, review queue, nightly re-validation |
 | State | SQLite (`.data/app.db`) | Cloud SQL Postgres, Firestore |
@@ -656,4 +682,4 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 | Observability | OTel -> JSONL, SQLite metrics, `/trace`, `/stats` | OTel -> Cloud Trace, logs -> BigQuery, Cloud Monitoring SLOs and alerts |
 | Persona | File, hot-reloaded | Firestore registry, admin console, preview, rollback |
 | Learning | Explicit preferences | Plus implicit preference proposals and the system-level loop |
-| Evaluation | 169 offline tests | Plus live eval harness, LLM judge, shadow and canary |
+| Evaluation | About 275 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |

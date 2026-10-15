@@ -201,6 +201,7 @@ U, I, O = USERS, ITEMS, ORDERS
         (f"SELECT u.state, MAX(u.id) AS cid, COUNT(*) AS n FROM {U} u GROUP BY u.state HAVING COUNT(*) = 1", "customer_id_use"),
         (f"SELECT MAX(oi.user_id) AS customer, SUM(oi.sale_price) FROM {I} oi JOIN {U} u ON u.id = oi.user_id WHERE u.state = 'Texas' GROUP BY oi.user_id", "customer_id_use"),
         (f"SELECT u.state, APPROX_TOP_COUNT(u.city, 100) FROM {U} u GROUP BY 1", "not_allowed"),
+        (f"SELECT u.state, APPROX_QUANTILES(u.age, 100) AS ages FROM {U} u GROUP BY 1", "not_allowed"),
         (f"SELECT CONCAT(CAST(u.id AS STRING), u.state) AS x FROM {U} u", "customer_id_use"),
         # review C4: grouping by a per-customer column
         (f"SELECT MAX(o.user_id) AS uid, MAX(o.gender) AS g FROM {O} o GROUP BY o.order_id", "customer_id_use"),
@@ -249,6 +250,7 @@ def test_customer_attributes_rejected(guard, sql, kind):
         # conditional counts, shares and semi-joins on customer ID
         f"SELECT u.gender, COUNT(DISTINCT IF(u.state = 'Texas', u.id, NULL)) AS texans FROM {U} u GROUP BY 1",
         f"SELECT u.state, COUNT(*) AS n, SUM(COUNT(*)) OVER () AS total FROM {U} u GROUP BY 1",
+        f"SELECT u.state, APPROX_QUANTILES(u.age, 2)[OFFSET(1)] AS median_age FROM {U} u GROUP BY 1",
         f"SELECT p.category, COUNT(*) FROM {I} oi JOIN {PRODUCTS} p ON p.id = oi.product_id "
         f"WHERE oi.user_id IN (SELECT id FROM {U} WHERE age > 60) GROUP BY 1",
         f"SELECT state, COUNT(*) FROM (SELECT id, state FROM {U} UNION ALL SELECT id, state FROM {U}) GROUP BY state",

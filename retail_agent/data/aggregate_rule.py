@@ -19,8 +19,8 @@ grouping, ordering):
 
 A1  No construct that can pack many customers or a whole record into one value:
     ARRAY_AGG, STRING_AGG, ARRAY(...), [...], STRUCT, TO_JSON(_STRING), FORMAT,
-    SELECT AS STRUCT / VALUE, aggregates outside a small allowlist, functions
-    sqlglot does not recognise. Whole-row references are rejected in every mode.
+    SELECT AS STRUCT / VALUE, aggregates outside a small allowlist (one quantile,
+    APPROX_QUANTILES(x, n)[OFFSET(k)], is fine), functions sqlglot does not recognise. Whole-row references are rejected in every mode.
 A2  Customer IDs only join (a.id = b.user_id, id IN (SELECT user_id ...)), are
     counted (COUNT, COUNT(DISTINCT), APPROX_COUNT_DISTINCT), group or pass through
     a per-customer subquery. Never compared with a value, computed with or listed.
@@ -252,10 +252,12 @@ class _Analysis:
                 self._add("not_allowed",
                           f"{name} is not allowed in a query that uses customer attributes: it can pack many "
                           f"customers into one value. {ATTRIBUTES_HELP}")
-            elif isinstance(node, exp.AggFunc) and not isinstance(node, ALLOWED_AGGREGATES) and not _windowed(node):
+            elif (isinstance(node, exp.AggFunc) and not isinstance(node, ALLOWED_AGGREGATES) and not _windowed(node)
+                  and not _single_quantile(node)):
                 self._add("not_allowed",
                           f"Aggregate {name} is not allowed with customer attributes. Use COUNT, COUNTIF, SUM, AVG, "
-                          "MIN, MAX, STDDEV, VARIANCE, CORR or APPROX_COUNT_DISTINCT.")
+                          "MIN, MAX, STDDEV, VARIANCE, CORR, APPROX_COUNT_DISTINCT or one quantile, e.g. the "
+                          "median APPROX_QUANTILES(x, 2)[OFFSET(1)].")
             elif isinstance(node, exp.Anonymous) and name not in KNOWN_SCALARS:
                 self._add("not_allowed", f"Function {name} is not available in a query that uses customer attributes.")
 
@@ -558,6 +560,18 @@ def _windowed(agg: exp.Expression) -> bool:
     while isinstance(node.parent, (exp.IgnoreNulls, exp.RespectNulls)):
         node = node.parent
     return isinstance(node.parent, exp.Window) and node.parent.this is node
+
+
+def _single_quantile(agg: exp.Expression) -> bool:
+    """APPROX_QUANTILES(x, n)[OFFSET(k)]: one order statistic, like MIN or MAX (the whole array is not)."""
+    parent = agg.parent
+    return (
+        isinstance(agg, exp.ApproxQuantiles)
+        and isinstance(parent, exp.Bracket)
+        and parent.this is agg
+        and len(parent.expressions) == 1
+        and isinstance(parent.expressions[0], exp.Literal)
+    )
 
 
 def _has_plain_aggregate(select: exp.Select) -> bool:

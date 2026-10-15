@@ -4,7 +4,7 @@
   uses the new tone, no restart or deploy. Only TONE and STYLE belong here;
   safety rules and data rules are in code and cannot be changed from this file.
   In production this text lives in a versioned prompt registry with an
-  admin form, review and one-click rollback (docs/architecture.md, "Persona").
+  admin form, review and one-click rollback (docs/technical-design.md §10).
 -->
 # Tone of the week
 
