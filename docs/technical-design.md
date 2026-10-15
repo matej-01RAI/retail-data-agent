@@ -247,50 +247,51 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    a PII column by name, anywhere (select, filter, order, join, subquery alias), is rejected with
    a message that tells the model what to use instead. A CTE may not take a table's name (it
    would hide the real table from the rewrite), and user-defined or qualified functions are
-   rejected. Then it applies the **aggregate-only rule**: it qualifies the query against the
-   safe schema (stars expand to non-PII columns) and traces every column to its base column
-   through CTEs, derived tables, set operations, UNNEST and subqueries. A query that never
-   reaches a customer attribute runs as written: customer lists by `user_id` with purchase
-   metrics are allowed. A query that uses one anywhere (output, filter, join, group, order):
-   - **A1:** may not pack many customers or a whole record into one value: no `ARRAY_AGG`,
-     `STRING_AGG`, `ARRAY(...)`, `STRUCT`, `TO_JSON_STRING`, `FORMAT`, `SELECT AS STRUCT`,
-     aggregates outside an allowlist (one quantile, such as the median, is fine), or functions the
-     parser does not recognise. Whole-row
-     references are rejected in every query.
-   - **A2:** uses IDs (customer, order and order-line IDs, and row numbers that are not per
-     customer) only to join (`u.id = oi.user_id`, `user_id IN (SELECT ...)` with a real customer
-     ID on the left), to count (`COUNT(DISTINCT user_id)`) or to group a per-customer or per-order
-     CTE. Never compared with a value, computed with or listed, so neither "customer 35's state"
-     nor "the state of whoever placed order 1" can be asked for.
-   - **A3:** uses a per-customer subquery as a table (or `user_id IN (...)`), never as a scalar or
-     `EXISTS` subquery, because only a table's customers can be counted.
-   - **A4:** releases its result only through aggregation across customers: the final output is
-     never one row per customer, order or anything finer.
-   - **A5:** every aggregating SELECT that is not grouped by a customer ID gets
-     `HAVING COUNT(DISTINCT <customer id>) >= 5` **injected into the SQL that runs**, for every
-     set of customers it reads (tables joined on customer ID by an inner join count once; a
-     derived table that drops the customer ID, or merges customers' rows with `UNION`, is
-     rejected, because padding could inflate the count). Smaller groups disappear, and the model
-     is told so it can mention a missing segment.
-   - **A6:** inside such a SELECT, every aggregate reads its whole group rather than picking rows
-     out of it. A condition inside an aggregate (`COUNTIF(status = 'Returned')`,
-     `SUM(IF(cond, sale_price, 0))`) gets its own 5-customer check, and the cell is NULL below
-     it. Other conditions and non-linear functions of non-attribute data inside an aggregate are
-     rejected (they can build a selector such as `1 / (ABS(price - 99.99) + 1)`), and so is summing
-     a value an earlier per-customer step computed with a condition. MIN, MAX, ANY_VALUE and
-     quantiles are allowed only on the attributes: a single price or timestamp can be looked up to
-     find its buyer.
+   rejected. Then it applies the **aggregate-only rule** (`data/aggregate_rule.py`). It qualifies
+   the query against the safe schema (stars expand to non-PII columns) and traces every column to
+   its base column. A query that never reaches a customer attribute runs as written: customer
+   lists by `user_id` with purchase metrics are allowed. A query that uses one anywhere (output,
+   filter, join, group, order) must fit an **allowlisted shape**, because no list of forbidden
+   tricks survives arbitrary SQL (three red-team rounds found windows that copy one customer's
+   value onto every row, rounding functions that build a one-row picker, row multiplication,
+   UNION padding, correlated subqueries...):
+   - One aggregation: `SELECT dimensions, aggregates FROM ... WHERE ... GROUP BY dimensions`, plus
+     `HAVING`, `ORDER BY`, `LIMIT` and `UNION ALL` of such SELECTs.
+   - **Dimensions** (GROUP BY and filters): any expression of attribute, category, date or amount
+     columns, but never an ID (customer, order, order line). An ID may only join tables, be counted
+     or be tested `IS NULL`, so neither "customer 35's state" nor "the state of whoever placed order
+     1" can be asked for.
+   - **Joins** on key relationships (`u.id = oi.user_id`, `o.order_id = oi.order_id`,
+     `oi.product_id = p.id`). An inner join may add filters; an outer join may not, because
+     `LEFT JOIN ... ON key AND <selector>` blanks every row but one's.
+   - **Aggregates**: `COUNT(*)`, `COUNT(DISTINCT col)`, `SUM` / `AVG` / `STDDEV` of plain amounts
+     (amount columns combined with `+ - *`, scaled by a constant, or day-level date differences;
+     no rounding, conditions or constant offsets), at most one condition per aggregate
+     (`COUNTIF(c)`, `SUM(IF(c, x, 0))`), and `MIN` / `MAX` / one quantile of attributes only (a
+     single price or timestamp can be looked up to find its buyer). Window functions only over the
+     finished aggregates (shares, ranks).
+   - **Steps** (CTEs, derived tables): rows (a filter that keeps `user_id`), a set of customers
+     (`SELECT user_id ... GROUP BY user_id HAVING ... [ORDER BY ... LIMIT n]`), or an aggregation
+     that follows these rules. Per-customer figures cannot be carried forward; they are ratios in the
+     final SELECT (`SUM(sale_price) / COUNT(DISTINCT user_id)`).
+   - Never: subqueries in expressions, `UNNEST`, `PIVOT`, recursion, `ARRAY_AGG` / `STRING_AGG` /
+     `STRUCT` / `TO_JSON_STRING` / `FORMAT`, `SELECT AS STRUCT`, unknown or user-defined functions,
+     whole-row references.
 
-   Anything untraceable in such a query (recursive CTEs, PIVOT, unqualified or duplicate names,
-   very deep nesting) fails closed, and so does any crash in the checker. A second red-team
-   review after this rewrite found three more bypasses (a one-row conditional aggregate, UNION
-   padding, `IN` with a generated list on the left); A2, A5 and A6 above close them, and every
-   attack from both reviews is a regression test. Rejections are fed back to the model with a fix-it
-   message, and it usually corrects itself in one step (for example, "top customers with their
-   state" becomes a customer list plus a by-state aggregate). What a threshold cannot stop is
-   differencing or reconstruction across several exact aggregates, or a handful of orders chosen
-   by exact time or price; production adds BigQuery's aggregation threshold (above), per-user
-   query auditing, and differential privacy where that matters.
+   Two checks are then **injected into the SQL that runs**: `HAVING COUNT(DISTINCT customer id) >= 5`
+   for every customer table or step the aggregation reads (smaller groups disappear), and for every
+   aggregate, `IF(COUNT(DISTINCT IF(<contributes>, customer id, NULL)) >= 5, aggregate, NULL)`,
+   where "contributes" means inside the aggregate's condition and with a non-zero, non-NULL value.
+   The second check stops one customer from dominating a total that others pad with zeros. The
+   model is told about both so it can mention a missing segment or figure. Anything the checker
+   cannot trace fails closed, and so does any crash in it. Rejections are fed back to the model with
+   a fix-it message, and it usually corrects itself in one step (for example, "top customers with
+   their state" becomes a customer list plus a by-state aggregate). The price of the allowlist is
+   that some legitimate analyses need another form or the attribute-free path (for example, order
+   gaps by gender need a window function: allowed without the gender). What it cannot stop is
+   differencing or reconstruction across several exact aggregates, especially combined with
+   attribute-free queries; production adds BigQuery's aggregation threshold (above), per-user query
+   auditing, and differential privacy where that matters.
    Then, before running:
    - BigQuery **dry run**: statement type must be SELECT; referenced tables must be inside the
      dataset; estimated bytes must be within the cap.
@@ -298,7 +299,7 @@ user's scope, and retrieval must map benchmark questions to the right trio.
 4. **Result handling.** At most N rows go to the model (the agent is told to aggregate in SQL).
    String cells pass the PII scrubber.
    - **Small groups:** groups of fewer than 5 customers are removed twice over: by the guard's
-     injected `HAVING` (prototype and production) and by the aggregation threshold (production).
+     injected checks (prototype and production) and by the aggregation threshold (production).
    - Cells that hold arrays or structs are converted and scrubbed element by element.
    - Ages are presented as bands.
 5. **Input guard.** Model Armor (prompt injection, jailbreak, malicious URLs) plus cheap
@@ -324,11 +325,11 @@ reaches the model provider.
 |---|---|
 | Identity / scope | `config/users.yaml` (the access table: CEO = all, brand managers = their brands) + `--user`; `ProductScope` passed via `Deps`; `doctor` checks every scope matches products |
 | Warehouse enforcement | Simulated by the guard's rewrite: every table becomes a subquery projecting only non-PII columns and filtered to the user's brands (`orders` and `users` only through in-scope order lines; `num_of_item` recounted over in-scope items) |
-| Query guard | `data/sql_guard.py`; aggregate-only rule and group-size injection in `data/aggregate_rule.py`; BigQuery dry-run checks in `data/warehouse.py` |
+| Query guard | `data/sql_guard.py`; the aggregate-only allowlist and the injected group-size checks in `data/aggregate_rule.py`; BigQuery dry-run checks in `data/warehouse.py` |
 | Result handling | Row cap (50), cell scrubbing including arrays and structs (`agent.py`) |
 | Input guard | `safety/input_guard.py` (injection patterns, size cap, PII masking) |
 | Output guard | `safety/pii.py` on answers and saved reports (emails, phones, street addresses, Luhn-valid cards, IPs; tested against false positives on business numbers) |
-| Tests | `tests/test_sql_guard.py` (about 100 rejected attack queries, every bypass from both reviews among them; about 30 legitimate ones; small groups and small conditional cells dropped on real data), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
+| Tests | `tests/test_sql_guard.py` (over 100 rejected attack queries, every bypass from three red-team reviews among them; about 30 legitimate ones; small groups and small cells dropped on real data), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
 
 ---
 
@@ -550,7 +551,7 @@ background, compared offline), then a canary rollout with SLO monitoring.
 
 ### 8.3 Prototype
 
-About 300 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
+About 320 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
 text safety, golden-trio validation for every scope, BigQuery dry-run and error classification
 against a fake runner, settings and CLI commands, and 32 end-to-end agent flows with a scripted
 model (self-correction, give-up bounds, empty results, PII, scope, injection, deletion flows,
@@ -697,4 +698,4 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 | Observability | OTel -> JSONL, SQLite metrics, `/trace`, `/stats` | OTel -> Cloud Trace, logs -> BigQuery, Cloud Monitoring SLOs and alerts |
 | Persona | File, hot-reloaded | Firestore registry, admin console, preview, rollback |
 | Learning | Explicit preferences | Plus implicit preference proposals and the system-level loop |
-| Evaluation | About 300 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |
+| Evaluation | About 320 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |

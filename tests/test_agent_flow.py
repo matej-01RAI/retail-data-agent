@@ -112,7 +112,7 @@ async def test_select_star_on_users_is_rejected_without_leaking(make_assistant):
 
     script = Script(call("run_sql", sql=f"SELECT * FROM {USERS} LIMIT 2", purpose="peek"), capture)
     await make_assistant(script).ask("peek at users")
-    assert "one row per customer" in captured["feedback"]
+    assert "individual customers' rows" in captured["feedback"]
     for column in ("first_name", "last_name", "email", "street_address", "postal_code", "latitude"):
         assert column not in captured["feedback"]
     assert "@example.com" not in captured["feedback"]

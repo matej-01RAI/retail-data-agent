@@ -15,7 +15,7 @@ dangerous to call.
 | High-level design (architecture diagrams, services, data flow, data stores) | [docs/architecture.md](docs/architecture.md) |
 | Detailed technical explanation, requirement by requirement | [docs/technical-design.md](docs/technical-design.md) |
 | Working prototype (CLI) | [`retail_agent/`](retail_agent) |
-| Tests (about 300, run by GitHub Actions on every push: safety red-team, end-to-end agent flows, golden-trio validation, BigQuery error handling) | [`tests/`](tests) |
+| Tests (about 320, run by GitHub Actions on every push: safety red-team, end-to-end agent flows, golden-trio validation, BigQuery error handling) | [`tests/`](tests) |
 
 ---
 
@@ -51,7 +51,7 @@ python -m retail_agent --user ceo --offline
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                            # about 300 tests, under 10 s
+pytest                            # about 320 tests, under 10 s
 ```
 
 ### Demo users and what they may see
@@ -112,7 +112,7 @@ Suggested script (one conversation):
 
 | Requirement | How (prototype) | Where | See it |
 |---|---|---|---|
-| **Safety & PII masking** | Every model-written query is parsed, checked and rewritten. It must be one read-only SELECT over the 4 tables. Any PII column reference is rejected with a fix-it message. Every table becomes a *scoped subquery* with no PII columns and only the user's brands. City, state, country, age, gender and traffic source are allowed **only in aggregates**: column-level tracing rejects them next to a customer ID, as filters on customer lists, row by row or packed into arrays and JSON, and every aggregate that uses them drops groups of fewer than 5 customers (a `HAVING` the guard adds to the SQL; a conditional count over fewer than 5 is blank). Order IDs are treated like customer IDs. Input guard blocks injection and masks pasted PII before the model sees it. Output and saved reports pass a PII scrubber. Off-topic requests are refused by the instructions. | `data/sql_guard.py`, `data/aggregate_rule.py`, `safety/`, `agent.py` | Q2, Q9, Q11; `tests/test_sql_guard.py` (about 100 attack queries from two red-team reviews, about 30 legitimate ones) |
+| **Safety & PII masking** | Every model-written query is parsed, checked and rewritten. It must be one read-only SELECT over the 4 tables. Any PII column reference is rejected with a fix-it message. Every table becomes a *scoped subquery* with no PII columns and only the user's brands. City, state, country, age, gender and traffic source are allowed **only in aggregates**: a query that uses them must fit an allowlisted aggregation shape (no IDs as dimensions or filters, plain sums and counts, no windows or subqueries over rows), and the guard adds checks to the SQL that drop groups of fewer than 5 customers and blank any figure fewer than 5 customers contribute to. Input guard blocks injection and masks pasted PII before the model sees it. Output and saved reports pass a PII scrubber. Off-topic requests are refused by the instructions. | `data/sql_guard.py`, `data/aggregate_rule.py`, `safety/`, `agent.py` | Q2, Q9, Q11; `tests/test_sql_guard.py` (over 100 attack queries from three red-team reviews, about 30 legitimate ones) |
 | **High-stakes oversight** | `delete_reports` is an approval-required tool: the run pauses, code (not the model) resolves the exact reports owned by the user, the CLI shows them and requires the phrase `delete N`, and the deletion runs with arguments pinned to those IDs. Soft delete, `/undo`, audit log. A confirmed deletion is always reported, even if the model fails afterwards. | `approvals.py`, `assistant.py`, `store.py` | Q8; `tests/test_agent_flow.py` (confirm, cancel, pinned IDs, owner isolation) |
 | **Resilience & error handling** | SQL errors, guard rejections and empty results go back to the model to fix, at most 3 consecutive attempts, then it must stop and explain. Per-question budgets (model calls, queries, tokens, timeout). BigQuery: dry run, bytes ceiling, typed errors, retry with backoff, circuit breaker, result cache. Gemini: SDK retries, fallback model, client-side rate limiter. Every failure becomes a clear message; the UI never crashes and history is kept. Ctrl-C stops the current answer, not the chat. | `agent.py` (`_run_sql`), `data/warehouse.py`, `llm.py`, `assistant.py` | Q6, Q7; resilience tests |
 | **Observability** | OpenTelemetry spans for every turn, model request (tokens, messages) and tool call, exported as JSONL (OTLP in production). A `turns` table with outcome, latency, tokens, SQL attempts, failures, self-corrections, guardrail and PII counters, fallback use. `sql_events` for each query attempt. `/trace` shows the message correspondence, SQL attempts and spans of a turn (your own turns only); `/stats` aggregates. Everything stored is PII-scrubbed first. | `observability.py`, `cli.py` | Q10 |
@@ -176,10 +176,12 @@ with the framework you choose to present.*
 
 ## Limitations (prototype)
 
-- The minimum group size stops small groups and one-row tricks, not differencing: several exact
-  aggregates (or a handful of orders picked by exact time or price) can still reveal something
-  about one person. Production adds BigQuery's aggregation threshold, query auditing and, where
-  it matters, differential privacy.
+- The allowlist and the 5-customer checks stop one query from exposing a person, not
+  differencing or reconstruction across several exact aggregates combined with attribute-free
+  queries. Production adds BigQuery's aggregation threshold, query auditing and, where it
+  matters, differential privacy. The allowlist also turns away some legitimate attribute
+  analyses (window functions over rows, per-customer figures carried in a CTE); the model is
+  told the supported form.
 - The CLI has no login: `--user` selects a demo identity. Production uses SSO (see the HLD).
 - Name detection in free text is not pattern-based. Names cannot be queried at all, and the
   output scrubber catches emails, phones, addresses, card numbers and IPs. Production adds Cloud
@@ -205,7 +207,7 @@ retail_agent/
   data/
     bigquery_runner.py  the provided BigQueryRunner (bugs fixed, extended)
     sql_guard.py        read-only / allowlist / PII / brand-scope rewrite
-    aggregate_rule.py   customer attributes only in aggregates, groups of 5+ (column tracing)
+    aggregate_rule.py   customer attributes only in aggregates: allowlisted shape, groups of 5+
     warehouse.py        BigQuery + DuckDB backends, typed errors, retries, circuit breaker
     sample_db.py        synthetic thelook-shaped dataset for offline mode
   safety/

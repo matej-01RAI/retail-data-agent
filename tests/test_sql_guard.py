@@ -244,6 +244,26 @@ U, I, O = USERS, ITEMS, ORDERS
         (f"WITH po AS (SELECT oi.order_id, u.gender, SUM(oi.sale_price) total FROM {I} oi JOIN {U} u ON u.id = oi.user_id "
          f"GROUP BY oi.order_id, u.gender) SELECT gender, AVG(total) FROM po GROUP BY 1", "no_customer_id"),
         (f"SELECT oi.user_id, MAX(u.state) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY ALL", "customer_attributes"),
+        # third review: windows copying one row onto every row, attribute-only selectors, correlated
+        # subqueries, rounding tricks, row multiplication, FILTER
+        (f"WITH r AS (SELECT u.id, FIRST_VALUE(u.state) OVER (ORDER BY u.id) s, FIRST_VALUE(u.age) OVER (ORDER BY u.id) a "
+         f"FROM {U} u) SELECT MAX(r.s), MAX(r.a) FROM r", "not_allowed"),
+        (f"WITH g AS (SELECT o.user_id, o.gender, DATE_DIFF(DATE(o.created_at), LAG(DATE(o.created_at)) OVER "
+         f"(PARTITION BY o.user_id ORDER BY o.created_at), DAY) gap FROM {O} o) SELECT g.gender, AVG(g.gap) FROM g GROUP BY 1", "not_allowed"),
+        (f"SELECT SUM(IF(u.state = 'Tokyo' AND u.age = 14, TIMESTAMP_DIFF(oi.created_at, TIMESTAMP '1970-01-01', MICROSECOND), 0)) "
+         f"FROM {I} oi JOIN {U} u ON u.id = oi.user_id", "not_allowed"),
+        (f"SELECT MAX(IF((SELECT COUNT(*) FROM {PRODUCTS} p WHERE p.id = oi.product_id AND oi.created_at = TIMESTAMP '2024-01-01') = 1, "
+         f"u.state, NULL)) FROM {I} oi JOIN {U} u ON u.id = oi.user_id", "subquery"),
+        (f"SELECT SUM(u.age * DATE_DIFF(DATE(TIMESTAMP_ADD(u.created_at, INTERVAL 5 MICROSECOND)), "
+         f"DATE(TIMESTAMP_ADD(u.created_at, INTERVAL 4 MICROSECOND)), DAY)) FROM {U} u", "not_allowed"),
+        (f"SELECT AVG(u.age) FROM {U} u CROSS JOIN UNNEST(GENERATE_ARRAY(1, IF(u.created_at = TIMESTAMP '2024-01-01', 1000000, 1))) w", "not_allowed"),
+        (f"SELECT AVG(u.age) FROM {U} u LEFT JOIN {PRODUCTS} p ON u.created_at = TIMESTAMP '2024-01-01'", "join"),
+        (f"SELECT MAX(u.state) FILTER (WHERE u.created_at = TIMESTAMP '2024-01-01') FROM {U} u", "not_allowed"),
+        (f"WITH c AS (SELECT u.id FROM {U} u LEFT JOIN {O} o ON o.user_id = u.id AND o.created_at = TIMESTAMP '2024-01-01') "
+         f"SELECT u.state, COUNT(*) FROM c JOIN {U} u ON u.id = c.id GROUP BY 1", "join"),
+        (f"SELECT u.state, SUM(oi.sale_price - 99.99 + 0.000001) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1", "not_allowed"),
+        (f"WITH f AS (SELECT o.user_id, o.gender, ROW_NUMBER() OVER (PARTITION BY o.user_id ORDER BY o.created_at) rn FROM {O} o) "
+         f"SELECT f.gender, COUNTIF(f.rn = 1) AS new_orders FROM f GROUP BY 1", "not_allowed"),
         # what cannot be traced is rejected
         (f"SELECT t.x, COUNT(*) FROM (SELECT u.id AS x, u.state AS x FROM {U} u) t GROUP BY t.x", "unverifiable"),
         (f"WITH RECURSIVE r AS (SELECT u.id, u.state FROM {U} u UNION ALL SELECT r.id, r.state FROM r WHERE FALSE) SELECT state, COUNT(*) FROM r GROUP BY 1", "unverifiable"),
@@ -251,10 +271,44 @@ U, I, O = USERS, ITEMS, ORDERS
     ],
 )
 def test_customer_attributes_rejected(guard, sql, kind):
+    """Every attack is rejected. `kind` names the concern it tests; the rule may report another
+    reason first (the allowlist usually catches an attack before the specific check would)."""
+    with pytest.raises(SqlRejected) as err:
+        guard.prepare(sql, BRANDS)
+    assert err.value.kind in REJECTION_KINDS
+    assert err.value.message
+
+
+REJECTION_KINDS = {
+    "customer_attributes", "not_aggregated", "customer_id_use", "not_allowed", "subquery", "join",
+    "no_customer_id", "unverifiable", "table_reference", "invalid_sql",
+}
+
+
+@pytest.mark.parametrize(
+    "sql, kind, says",
+    [
+        (f"SELECT oi.user_id, u.state, SUM(oi.sale_price) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1, 2",
+         "customer_attributes", "one row per customer"),
+        (f"SELECT * FROM {U} LIMIT 5", "customer_attributes", "individual customers' rows"),
+        (f"SELECT u.state, COUNT(*) FROM {U} u WHERE u.id = 35 GROUP BY 1", "customer_id_use", "never filter on specific"),
+        (f"SELECT u.state, ARRAY_AGG(u.id) FROM {U} u GROUP BY 1", "not_allowed", "pack many customers"),
+        (f"SELECT oi.user_id FROM {I} oi WHERE EXISTS (SELECT 1 FROM {U} u WHERE u.id = oi.user_id AND u.age > 60)",
+         "subquery", "join a CTE instead"),
+        (f"WITH tx AS (SELECT oi.sale_price FROM {I} oi JOIN {U} u ON u.id = oi.user_id WHERE u.age = 93) "
+         f"SELECT SUM(sale_price) FROM tx", "no_customer_id", "Keep user_id"),
+        (f"SELECT u.state, MAX(oi.sale_price) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1",
+         "not_allowed", "looked up"),
+        (f"WITH c AS (SELECT oi.user_id, SUM(oi.sale_price) spend FROM {I} oi GROUP BY 1) "
+         f"SELECT u.state, AVG(c.spend) FROM c JOIN {U} u ON u.id = c.user_id GROUP BY 1",
+         "not_allowed", "SUM(sale_price) / COUNT(DISTINCT user_id)"),
+    ],
+)
+def test_rejections_tell_the_model_what_to_do(guard, sql, kind, says):
     with pytest.raises(SqlRejected) as err:
         guard.prepare(sql, BRANDS)
     assert err.value.kind == kind
-    assert err.value.message
+    assert says in err.value.message
 
 
 @pytest.mark.parametrize(
@@ -277,17 +331,20 @@ def test_customer_attributes_rejected(guard, sql, kind):
         # conditional aggregates (each gets its own 5-customer check), windows per customer, per-order tables
         f"SELECT u.gender, SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'), COUNTIF(oi.status IN ('Complete', 'Returned'))) AS rr "
         f"FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1",
-        f"WITH f AS (SELECT o.user_id, o.gender, ROW_NUMBER() OVER (PARTITION BY o.user_id ORDER BY o.created_at) rn FROM {O} o) "
-        f"SELECT f.gender, COUNTIF(f.rn = 1) AS new_orders FROM f GROUP BY 1",
-        f"WITH g AS (SELECT o.user_id, o.gender, DATE_DIFF(DATE(o.created_at), LAG(DATE(o.created_at)) OVER "
-        f"(PARTITION BY o.user_id ORDER BY o.created_at), DAY) gap FROM {O} o) SELECT g.gender, AVG(g.gap) FROM g GROUP BY 1",
-        f"WITH po AS (SELECT oi.order_id, oi.user_id, u.gender, SUM(oi.sale_price) total FROM {I} oi JOIN {U} u ON u.id = oi.user_id "
-        f"GROUP BY oi.order_id, oi.user_id, u.gender) SELECT gender, AVG(total) AS aov FROM po GROUP BY 1",
-        f"WITH c AS (SELECT o.user_id, MIN(DATE(o.created_at)) first_order FROM {O} o GROUP BY 1) SELECT u.state, "
-        f"AVG(DATE_DIFF(CURRENT_DATE(), c.first_order, DAY)) AS tenure FROM c JOIN {U} u ON u.id = c.user_id GROUP BY 1",
+        # a set of customers picked per customer, then profiled
+        f"WITH first AS (SELECT o.user_id FROM {O} o GROUP BY 1 HAVING MIN(DATE(o.created_at)) >= DATE '2024-01-01') "
+        f"SELECT u.gender, COUNT(*) AS new_customers FROM first JOIN {U} u ON u.id = first.user_id GROUP BY 1",
+        # per-customer and per-order figures as ratios of aggregates
+        f"SELECT u.gender, SUM(oi.sale_price) / COUNT(DISTINCT oi.order_id) AS aov, "
+        f"SUM(oi.sale_price) / COUNT(DISTINCT oi.user_id) AS spend_per_customer FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1",
+        f"SELECT u.state, AVG(DATE_DIFF(CURRENT_DATE(), DATE(o.created_at), DAY)) AS order_age FROM {O} o "
+        f"JOIN {U} u ON u.id = o.user_id GROUP BY 1",
+        # a CTE that filters rows, keeping user_id
+        f"WITH done AS (SELECT oi.user_id, oi.sale_price FROM {I} oi WHERE oi.status = 'Complete') "
+        f"SELECT u.country, SUM(done.sale_price) FROM done JOIN {U} u ON u.id = done.user_id GROUP BY 1",
         f"(SELECT u.state, COUNT(*) AS n FROM {U} u GROUP BY 1)",
         f"SELECT p.category, COUNT(*) FROM {I} oi JOIN {PRODUCTS} p ON p.id = oi.product_id "
-        f"WHERE oi.user_id IN (SELECT id FROM {U} WHERE age > 60) GROUP BY 1",
+        f"JOIN {U} u ON u.id = oi.user_id WHERE u.age > 60 GROUP BY 1",
         # an already-aggregated table can be read row by row
         f"SELECT x.state, x.n FROM (SELECT state, COUNT(*) AS n FROM {U} GROUP BY 1) x ORDER BY x.n DESC",
     ],
@@ -352,3 +409,24 @@ def test_deep_nesting_is_rejected_not_crashed(guard):
     with pytest.raises(SqlRejected) as err:
         guard.prepare("SELECT " + "(" * 200 + "1" + ")" * 200, ALL)
     assert err.value.kind == "invalid_sql"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        f"SELECT COUNT(*) FROM ({USERS} u JOIN {ITEMS} oi ON oi.user_id = u.id)",
+        f"SELECT COUNT(*) FROM {USERS} u TABLESAMPLE SYSTEM (10 PERCENT)",
+        f"SELECT COUNT(*) FILTER (WHERE status = 'Complete') FROM {ORDERS}",
+    ],
+)
+def test_syntax_the_rewrite_cannot_keep_is_rejected(guard, sql):
+    with pytest.raises(SqlRejected) as err:
+        guard.prepare(sql, ALL)
+    assert err.value.kind == "invalid_sql"
+
+
+def test_integer_division_keeps_its_grouping_offline(sample_db):
+    from retail_agent.data.warehouse import DuckDBWarehouse
+
+    warehouse = DuckDBWarehouse(sample_db, "bigquery-public-data.thelook_ecommerce")
+    assert warehouse.query("SELECT DIV(11 - 1, 5) AS x", labels={}, max_rows=1).rows == [[2]]

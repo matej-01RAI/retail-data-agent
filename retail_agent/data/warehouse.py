@@ -298,6 +298,12 @@ class DuckDBWarehouse:
             if (table.catalog or "").lower() == self.project.lower() and (table.db or "").lower() == self.dataset.lower():
                 table.set("catalog", None)
                 table.set("db", None)
+        # sqlglot writes DIV(a - 1, 5) as `a - 1 // 5` for DuckDB, where // binds tighter: keep the grouping.
+        for node in list(tree.find_all(exp.IntDiv)):
+            for arg in ("this", "expression"):
+                child = node.args.get(arg)
+                if isinstance(child, exp.Binary):
+                    child.replace(exp.Paren(this=child.copy()))
         return tree.sql(dialect="duckdb")
 
     def query(self, sql: str, *, labels: dict[str, str], max_rows: int) -> QueryResult:

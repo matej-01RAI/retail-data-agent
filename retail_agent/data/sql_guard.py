@@ -163,6 +163,8 @@ class SqlGuard:
                     f"User-defined or qualified functions ({func.sql('bigquery').split('(')[0]}) are not available; "
                     "use BigQuery built-in functions.",
                 )
+        if tree.find(exp.Filter):
+            raise SqlRejected("invalid_sql", "FILTER (WHERE ...) is not BigQuery syntax; use COUNTIF or IF inside the aggregate.")
         for func in tree.find_all(exp.Func):
             name = (func.sql_name() if not isinstance(func, exp.Anonymous) else func.name).upper()
             parent = func.parent
@@ -195,6 +197,9 @@ class SqlGuard:
         for table in tree.find_all(exp.Table):
             if not isinstance(table.this, exp.Identifier):
                 raise SqlRejected("forbidden_table", f"Table expression {table.sql('bigquery')!r} is not allowed.")
+            if table.args.get("joins") or table.args.get("sample"):
+                # The scope rewrite replaces the table node; joins nested in parentheses or a sample would be lost.
+                raise SqlRejected("invalid_sql", "Write joins without parentheses around them, and do not use TABLESAMPLE.")
             name = table.name.lower()
             db = (table.db or "").lower()
             catalog = (table.catalog or "").lower()

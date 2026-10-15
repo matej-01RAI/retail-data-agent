@@ -62,23 +62,16 @@ trios:
     question: Why are users in Texas underspending compared to users in California?
     tags: [state, underspending, spend per customer, compare segments, region, geography, why, frequency, basket]
     sql: |
-      WITH customer_spend AS (
-        SELECT u.state, oi.user_id,
-               COUNT(DISTINCT oi.order_id) AS orders,
-               SUM(oi.sale_price) AS spend
-        FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
-        JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
-        WHERE oi.status NOT IN ('Cancelled', 'Returned')
-          AND u.state IN ('Texas', 'California')
-        GROUP BY u.state, oi.user_id
-      )
-      SELECT state,
-             COUNT(*) AS customers,
-             ROUND(AVG(spend), 2) AS spend_per_customer,
-             ROUND(AVG(orders), 2) AS orders_per_customer,
-             ROUND(SAFE_DIVIDE(SUM(spend), SUM(orders)), 2) AS avg_order_value
-      FROM customer_spend
-      GROUP BY state
+      SELECT u.state,
+             COUNT(DISTINCT oi.user_id) AS customers,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT oi.user_id)), 2) AS spend_per_customer,
+             ROUND(SAFE_DIVIDE(COUNT(DISTINCT oi.order_id), COUNT(DISTINCT oi.user_id)), 2) AS orders_per_customer,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT oi.order_id)), 2) AS avg_order_value
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+        AND u.state IN ('Texas', 'California')
+      GROUP BY u.state
     report: >-
       "Underspending" needs a baseline: compare both states with each other and with the national
       average. Decompose spend per customer = orders per customer x average order value; that
