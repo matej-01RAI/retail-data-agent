@@ -182,17 +182,18 @@ class ReportStore:
         if session_id:
             sql += " AND session_id = ?"
             params.append(session_id)
-        if match_text:
-            pattern = f"%{match_text.lower().replace('%', '').replace('_', '')}%"
-            sql += " AND (LOWER(title) LIKE ? OR LOWER(body) LIKE ?)"
-            params += [pattern, pattern]
         if report_ids is not None:
             if not report_ids:
                 return []
             sql += f" AND id IN ({','.join('?' * len(report_ids))})"
             params += [r.upper() for r in report_ids]
         sql += " ORDER BY created_at"
-        return [self._row(r) for r in self.db.query(sql, params)]
+        reports = [self._row(r) for r in self.db.query(sql, params)]
+        if match_text:
+            # Matched in Python: literal text (no LIKE wildcards) and Unicode case-folding (São, MÜLLER).
+            needle = " ".join(match_text.split()).casefold()
+            reports = [r for r in reports if needle in " ".join(f"{r.title}\n{r.body}".split()).casefold()]
+        return reports
 
     def get(self, owner: str, report_id: str) -> Report | None:
         found = self.find(owner, report_ids=[report_id])

@@ -29,7 +29,7 @@ class FakeRunner:
         self.run = run
         self.configs = []
 
-    def dry_run(self, sql):
+    def dry_run(self, sql, timeout=None):
         if isinstance(self.dry, Exception):
             raise self.dry
         return self.dry
@@ -103,6 +103,19 @@ def test_errors_are_classified(error, kind):
     with pytest.raises(QueryError) as err:
         make(FakeRunner(run=error)).query("SELECT 1", labels={}, max_rows=1)
     assert err.value.kind == kind
+
+
+def test_a_query_that_uses_its_whole_time_is_not_retried():
+    from retail_agent.data.warehouse import ResilientWarehouse
+
+    wh = make(FakeRunner(run=TimeoutError("result() timed out")))
+    wh.timeout_s = 0  # the time budget is used up
+    resilient = ResilientWarehouse(wh, sleep=lambda s: None)
+    with pytest.raises(QueryError) as err:
+        resilient.run("SELECT 1", labels={}, max_rows=1)
+    assert err.value.kind == "timeout" and err.value.fixable_by_model and not err.value.transient
+    assert len(wh.runner.configs) == 1  # billed once, not three times
+    assert resilient.breaker.state == "closed"  # a heavy query is not an outage
 
 
 def test_syntax_errors_from_dry_run_go_back_to_the_model():

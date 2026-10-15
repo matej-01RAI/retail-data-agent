@@ -136,9 +136,8 @@ class Assistant:
             outcome, error_type, reply = "answered", None, ""
             new_messages: list[ModelMessage] = []
             try:
-                output, all_messages = await self._run(decision.text, deps, usage, limits)
+                output, all_messages, new_messages = await self._run(decision.text, deps, usage, limits)
                 reply = output
-                new_messages = all_messages[len(self.history):]
                 self.history = all_messages
             except UsageLimitExceeded as e:
                 outcome, error_type = "limit", f"UsageLimitExceeded: {e}"
@@ -160,6 +159,7 @@ class Assistant:
                 logger.exception("turn %s failed", turn_id)
                 outcome, error_type = "error", _describe(e)
             if outcome != "answered":
+                deps.stop()  # tool threads still running stop here; a change in progress finishes first
                 reply = FRIENDLY[outcome]
                 span.set_attribute("app.error", error_type or "")
                 if stats.side_effects:
@@ -184,7 +184,8 @@ class Assistant:
 
     async def _run(
         self, prompt: str, deps: Deps, usage: RunUsage, limits: UsageLimits
-    ) -> tuple[str, list[ModelMessage]]:
+    ) -> tuple[str, list[ModelMessage], list[ModelMessage]]:
+        """Returns (answer, history to keep, this turn's messages)."""
         timeout = self.services.settings.turn_timeout_s
         history = self._trimmed_history()
         result = await asyncio.wait_for(
@@ -208,7 +209,8 @@ class Assistant:
                 ),
                 timeout,
             )
-        return str(result.output), result.all_messages()
+        messages = result.all_messages()
+        return str(result.output), messages, messages[len(history):]
 
     async def _resolve_approvals(self, requests: DeferredToolRequests, deps: Deps) -> DeferredToolResults:
         out = DeferredToolResults()
@@ -242,6 +244,8 @@ class Assistant:
     def _trimmed_history(self) -> list[ModelMessage]:
         """Keep the last N user turns (cut only at a user prompt, so tool call/return pairs stay intact)."""
         keep = self.services.settings.history_turns
+        if keep <= 0:
+            return []
         starts = [
             i for i, m in enumerate(self.history)
             if isinstance(m, ModelRequest) and any(isinstance(p, UserPromptPart) for p in m.parts)

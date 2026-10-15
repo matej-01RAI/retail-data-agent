@@ -39,7 +39,7 @@ class QueryError(Exception):
 
     @property
     def fixable_by_model(self) -> bool:
-        return self.kind in ("invalid_sql", "too_expensive")
+        return self.kind in ("invalid_sql", "too_expensive", "timeout")
 
     @property
     def transient(self) -> bool:
@@ -164,7 +164,7 @@ class BigQueryWarehouse:
         try:
             # 1) Dry run: free, catches syntax/semantic errors, and lets us check
             #    statement type, referenced tables and bytes before paying.
-            dry = self.runner.dry_run(sql)
+            dry = self.runner.dry_run(sql, timeout=min(30.0, self.timeout_s))
             if (dry.statement_type or "SELECT").upper() != "SELECT":
                 raise QueryError("invalid_sql", f"Only SELECT statements may run (got {dry.statement_type}).")
             project, dataset = self.dataset.split(".", 1)
@@ -190,6 +190,8 @@ class BigQueryWarehouse:
             message = _bq_message(e)
             if "bytesBilledLimitExceeded" in str(e) or "bytes billed" in message.lower():
                 raise QueryError("too_expensive", message) from e
+            if "timed out" in message.lower() or "jobTimeout" in str(e):
+                raise self._timeout() from e
             raise QueryError("invalid_sql", message) from e
         except gexc.Forbidden as e:
             message = _bq_message(e)
@@ -203,14 +205,17 @@ class BigQueryWarehouse:
             gexc.GatewayTimeout,
             gexc.DeadlineExceeded,
             gexc.RetryError,
-            TimeoutError,
             ConnectionError,
         ) as e:
             raise QueryError("unavailable", _bq_message(e)) from e
-        except Exception as e:  # concurrent.futures.TimeoutError, auth errors, ...
+        except Exception as e:  # TimeoutError (= concurrent.futures.TimeoutError), auth errors, ...
             name = type(e).__name__
-            if "Timeout" in name:
-                raise QueryError("unavailable", f"BigQuery timed out after {self.timeout_s:.0f}s") from e
+            if isinstance(e, TimeoutError) or "Timeout" in name:
+                # The query used its whole time budget: a heavy query, which a retry would bill again.
+                # A network read timeout well before that is an outage blip, retried as usual.
+                if time.monotonic() - started >= 0.9 * self.timeout_s:
+                    raise self._timeout() from e
+                raise QueryError("unavailable", f"{name}: {_bq_message(e)}") from e
             if "DefaultCredentialsError" in name or "RefreshError" in name:
                 raise QueryError("permission", f"Google Cloud credentials are not configured ({name}).") from e
             raise QueryError("unavailable", f"{name}: {e}") from e
@@ -223,6 +228,13 @@ class BigQueryWarehouse:
             cache_hit=bool(df.attrs.get("cache_hit")),
             elapsed_ms=int((time.monotonic() - started) * 1000),
             job_id=df.attrs.get("job_id"),
+        )
+
+    def _timeout(self) -> QueryError:
+        return QueryError(
+            "timeout",
+            f"BigQuery stopped the query after {self.timeout_s:.0f}s. Aggregate in SQL, narrow the date range or "
+            "select fewer columns.",
         )
 
 
@@ -385,7 +397,7 @@ class ResilientWarehouse:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 cached: QueryResult = self._cache[key]
-                return QueryResult(**{**cached.__dict__, "cache_hit": True, "elapsed_ms": 0}), 0
+                return QueryResult(**{**cached.__dict__, "cache_hit": True, "elapsed_ms": 0, "bytes_processed": 0}), 0
         if not self.breaker.allow():
             raise QueryError(
                 "unavailable",

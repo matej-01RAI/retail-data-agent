@@ -31,7 +31,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .approvals import ApprovalRequest
-from .settings import Settings, load_settings
+from .settings import ROOT, Settings, SettingsError, load_settings, log_level
 
 console = Console()
 
@@ -493,7 +493,10 @@ def main(argv: list[str] | None = None) -> None:
     if not argv or argv[0] not in sub.choices and argv[0] not in ("-h", "--help"):
         argv = ["chat", *argv]
     args = parser.parse_args(argv)
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING"), format="%(levelname)s %(name)s: %(message)s")
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env", override=False)  # before logging, so LOG_LEVEL in .env applies
+    logging.basicConfig(level=log_level(), format="%(levelname)s %(name)s: %(message)s")
     commands = {
         "chat": lambda: chat(args),
         "ask": lambda: asyncio.run(ask(args)),
@@ -502,4 +505,8 @@ def main(argv: list[str] | None = None) -> None:
         "trace": lambda: trace_cmd(args),
         "sample-db": lambda: sample_db(args),
     }
-    commands[args.command]()
+    try:
+        commands[args.command]()
+    except SettingsError as e:
+        console.print(f"[red]Configuration error: {escape(str(e))}[/red] Check .env (see .env.example).")
+        sys.exit(2)

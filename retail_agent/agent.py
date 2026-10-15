@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -76,6 +78,24 @@ class Deps:
     turn_id: str
     stats: TurnStats
     progress: Callable[[str], None]
+    # Set when the turn ends early (timeout, error, Ctrl-C). Sync tools run in worker threads that
+    # outlive a cancelled turn, so they check it before querying or changing anything.
+    stopped: threading.Event = field(default_factory=threading.Event)
+    effects_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def stop(self) -> None:
+        """End the turn for its tools; waits for a change already in progress, so it can be reported."""
+        with self.effects_lock:
+            self.stopped.set()
+
+
+@contextmanager
+def side_effect(deps: Deps):
+    """Wrap a change (save, delete): it either finishes before the turn is stopped, or never starts."""
+    with deps.effects_lock:
+        if deps.stopped.is_set():
+            raise ToolFailed("This question was stopped, so nothing was changed.")
+        yield
 
 
 AgentOutput = str | DeferredToolRequests
@@ -259,7 +279,9 @@ def build_agent(services: Services, model: Model | str) -> Agent[Deps, AgentOutp
         deps = ctx.deps
         clean = scrub(body_markdown)
         deps.stats.pii_redactions += clean.redacted
-        report = deps.services.reports.save(deps.user.id, deps.session_id, scrub(title).text, clean.text)
+        with side_effect(deps):
+            report = deps.services.reports.save(deps.user.id, deps.session_id, scrub(title).text, clean.text)
+            deps.stats.side_effects.append(f"saved report {report.id} ({report.title}).")
         deps.progress(f"Saved report {report.id}")
         return {"report_id": report.id, "title": report.title, "status": "saved"}
 
@@ -302,10 +324,11 @@ def build_agent(services: Services, model: Model | str) -> Agent[Deps, AgentOutp
         deps = ctx.deps
         if not ctx.tool_call_approved or not report_ids:
             raise ToolFailed("Deletion was not confirmed by the user. Nothing was deleted.")
-        deleted = deps.services.reports.soft_delete(deps.user.id, deps.session_id, report_ids, batch=deps.turn_id)
-        titles = ", ".join(f"{r.id} ({r.title})" for r in deleted) or "none"
-        if deleted:
-            deps.stats.side_effects.append(f"deleted {len(deleted)} report(s): {titles}. /undo restores them.")
+        with side_effect(deps):
+            deleted = deps.services.reports.soft_delete(deps.user.id, deps.session_id, report_ids, batch=deps.turn_id)
+            titles = ", ".join(f"{r.id} ({r.title})" for r in deleted) or "none"
+            if deleted:
+                deps.stats.side_effects.append(f"deleted {len(deleted)} report(s): {titles}. /undo restores them.")
         return f"Deleted {len(deleted)} report(s): {titles}. The user can restore them with /undo."
 
     # ------------------------------------------------------------------ memory
@@ -342,6 +365,8 @@ def _retry_or_stop(deps: Deps, message: str) -> Exception:
 
 def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str, Any]:
     services, stats, settings = deps.services, deps.stats, deps.services.settings
+    if deps.stopped.is_set():  # a worker thread outliving its turn starts no new (billed) query
+        raise ToolFailed("This question was stopped.")
     if stats.sql_queries >= settings.max_queries_per_turn:
         raise ToolFailed(
             f"The query budget for this question ({settings.max_queries_per_turn} queries) is used up. "

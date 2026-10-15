@@ -89,12 +89,14 @@ class BigQueryRunner:
             logger.error(f"BigQuery execution failed: {str(e)}")
             raise
 
-    def dry_run(self, sql_query: str, job_config: Optional[bigquery.QueryJobConfig] = None) -> bigquery.QueryJob:
+    def dry_run(
+        self, sql_query: str, job_config: Optional[bigquery.QueryJobConfig] = None, timeout: Optional[float] = None
+    ) -> bigquery.QueryJob:
         """Validate a query without running it. Returns the job (statement type, bytes, tables)."""
         config = job_config or bigquery.QueryJobConfig()
         config.dry_run = True
         config.use_query_cache = False
-        return self.client.query(sql_query, job_config=config)
+        return self.client.query(sql_query, job_config=config, timeout=timeout)
 
     def get_table_schema(self, table_name: str) -> List[Dict[str, Any]]:
         """Get schema information for a specific table.

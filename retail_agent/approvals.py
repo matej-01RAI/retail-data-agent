@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import ToolApproved, ToolDenied
 
 if TYPE_CHECKING:
@@ -44,19 +45,33 @@ class ApprovalPolicy(Protocol):
     def plan(self, args: dict[str, Any], deps: Deps) -> ApprovalRequest | ToolDenied: ...
 
 
+class DeleteReportsArgs(BaseModel):
+    """The delete_reports parameters, validated the way the tool itself would read them
+    (so "false" is False, not a truthy string that previews every report)."""
+
+    match_text: str | None = None
+    this_conversation_only: bool = False
+    report_ids: list[str] | None = None
+    all_my_reports: bool = False
+
+
 class DeleteReportsPolicy:
     tool_name = "delete_reports"
 
     def plan(self, args: dict[str, Any], deps: Deps) -> ApprovalRequest | ToolDenied:
         store = deps.services.reports
         try:
+            parsed = DeleteReportsArgs.model_validate(args)
+        except ValidationError as e:
+            return ToolDenied(f"The deletion request was not valid ({e.error_count()} bad argument(s)). Nothing was deleted.")
+        try:
             plan = store.plan_deletion(
                 deps.user.id,
                 deps.session_id,
-                match_text=args.get("match_text") or None,
-                this_conversation_only=bool(args.get("this_conversation_only")),
-                report_ids=args.get("report_ids") or None,
-                all_my_reports=bool(args.get("all_my_reports")),
+                match_text=parsed.match_text or None,
+                this_conversation_only=parsed.this_conversation_only,
+                report_ids=parsed.report_ids or None,
+                all_my_reports=parsed.all_my_reports,
             )
         except (ValueError, TypeError) as e:
             return ToolDenied(f"The deletion request was not valid: {e} Nothing was deleted.")
