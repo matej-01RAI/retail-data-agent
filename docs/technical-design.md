@@ -257,9 +257,11 @@ user's scope, and retrieval must map benchmark questions to the right trio.
      aggregates outside an allowlist (one quantile, such as the median, is fine), or functions the
      parser does not recognise. Whole-row
      references are rejected in every query.
-   - **A2:** uses customer IDs only to join (`u.id = oi.user_id`, `user_id IN (SELECT ...)`), to
-     count (`COUNT(DISTINCT user_id)`) or to group a per-customer CTE. Never compared with a
-     value, computed with or listed, so "customer 35's state" cannot be asked for.
+   - **A2:** uses IDs (customer, order and order-line IDs, and row numbers that are not per
+     customer) only to join (`u.id = oi.user_id`, `user_id IN (SELECT ...)` with a real customer
+     ID on the left), to count (`COUNT(DISTINCT user_id)`) or to group a per-customer or per-order
+     CTE. Never compared with a value, computed with or listed, so neither "customer 35's state"
+     nor "the state of whoever placed order 1" can be asked for.
    - **A3:** uses a per-customer subquery as a table (or `user_id IN (...)`), never as a scalar or
      `EXISTS` subquery, because only a table's customers can be counted.
    - **A4:** releases its result only through aggregation across customers: the final output is
@@ -267,15 +269,28 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    - **A5:** every aggregating SELECT that is not grouped by a customer ID gets
      `HAVING COUNT(DISTINCT <customer id>) >= 5` **injected into the SQL that runs**, for every
      set of customers it reads (tables joined on customer ID by an inner join count once; a
-     derived table that drops the customer ID is rejected). Smaller groups disappear, and the
-     model is told so it can mention a missing segment.
+     derived table that drops the customer ID, or merges customers' rows with `UNION`, is
+     rejected, because padding could inflate the count). Smaller groups disappear, and the model
+     is told so it can mention a missing segment.
+   - **A6:** inside such a SELECT, every aggregate reads its whole group rather than picking rows
+     out of it. A condition inside an aggregate (`COUNTIF(status = 'Returned')`,
+     `SUM(IF(cond, sale_price, 0))`) gets its own 5-customer check, and the cell is NULL below
+     it. Other conditions and non-linear functions of non-attribute data inside an aggregate are
+     rejected (they can build a selector such as `1 / (ABS(price - 99.99) + 1)`), and so is summing
+     a value an earlier per-customer step computed with a condition. MIN, MAX, ANY_VALUE and
+     quantiles are allowed only on the attributes: a single price or timestamp can be looked up to
+     find its buyer.
 
-   Anything untraceable in such a query (recursive CTEs, PIVOT, unqualified names) fails closed,
-   and so does any crash in the checker. Rejections are fed back to the model with a fix-it
+   Anything untraceable in such a query (recursive CTEs, PIVOT, unqualified or duplicate names,
+   very deep nesting) fails closed, and so does any crash in the checker. A second red-team
+   review after this rewrite found three more bypasses (a one-row conditional aggregate, UNION
+   padding, `IN` with a generated list on the left); A2, A5 and A6 above close them, and every
+   attack from both reviews is a regression test. Rejections are fed back to the model with a fix-it
    message, and it usually corrects itself in one step (for example, "top customers with their
    state" becomes a customer list plus a by-state aggregate). What a threshold cannot stop is
-   differencing two large aggregates; production adds BigQuery's aggregation threshold (above),
-   and differential privacy where that matters.
+   differencing or reconstruction across several exact aggregates, or a handful of orders chosen
+   by exact time or price; production adds BigQuery's aggregation threshold (above), per-user
+   query auditing, and differential privacy where that matters.
    Then, before running:
    - BigQuery **dry run**: statement type must be SELECT; referenced tables must be inside the
      dataset; estimated bytes must be within the cap.
@@ -313,7 +328,7 @@ reaches the model provider.
 | Result handling | Row cap (50), cell scrubbing including arrays and structs (`agent.py`) |
 | Input guard | `safety/input_guard.py` (injection patterns, size cap, PII masking) |
 | Output guard | `safety/pii.py` on answers and saved reports (emails, phones, street addresses, Luhn-valid cards, IPs; tested against false positives on business numbers) |
-| Tests | `tests/test_sql_guard.py` (about 90 rejected attack queries, every bypass found in review among them; 24 legitimate ones; small groups dropped on real data), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
+| Tests | `tests/test_sql_guard.py` (about 100 rejected attack queries, every bypass from both reviews among them; about 30 legitimate ones; small groups and small conditional cells dropped on real data), `tests/test_safety_text.py`, end-to-end PII, aggregate-only and scope tests in `tests/test_agent_flow.py` |
 
 ---
 
@@ -535,7 +550,7 @@ background, compared offline), then a canary rollout with SLO monitoring.
 
 ### 8.3 Prototype
 
-About 275 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
+About 300 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
 text safety, golden-trio validation for every scope, BigQuery dry-run and error classification
 against a fake runner, settings and CLI commands, and 32 end-to-end agent flows with a scripted
 model (self-correction, give-up bounds, empty results, PII, scope, injection, deletion flows,
@@ -682,4 +697,4 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 | Observability | OTel -> JSONL, SQLite metrics, `/trace`, `/stats` | OTel -> Cloud Trace, logs -> BigQuery, Cloud Monitoring SLOs and alerts |
 | Persona | File, hot-reloaded | Firestore registry, admin console, preview, rollback |
 | Learning | Explicit preferences | Plus implicit preference proposals and the system-level loop |
-| Evaluation | About 275 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |
+| Evaluation | About 300 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |

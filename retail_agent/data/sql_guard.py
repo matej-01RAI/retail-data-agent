@@ -96,6 +96,12 @@ class SqlGuard:
     # ------------------------------------------------------------------ public
 
     def prepare(self, sql: str, scope: ProductScope) -> GuardedQuery:
+        try:
+            return self._prepare(sql, scope)
+        except RecursionError:
+            raise SqlRejected("invalid_sql", "The query is nested too deeply to check. Use CTEs instead of deep nesting.") from None
+
+    def _prepare(self, sql: str, scope: ProductScope) -> GuardedQuery:
         tree = self._parse_single_query(sql)
         cte_names = self._check_ctes(tree)
         self._check_functions(tree)
@@ -125,6 +131,9 @@ class SqlGuard:
         if len(statements) != 1:
             raise SqlRejected("not_read_only", "Send exactly one SELECT statement (no ';'-separated scripts).")
         tree = statements[0]
+        # (SELECT ...) on its own: the parentheses add nothing.
+        while isinstance(tree, exp.Subquery) and {k for k, v in tree.args.items() if v} == {"this"}:
+            tree = tree.this.pop()
         if not isinstance(tree, exp.Query):
             raise SqlRejected(
                 "not_read_only",

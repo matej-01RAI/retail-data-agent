@@ -5,39 +5,52 @@ in aggregates; customers may be referenced by user_id.
 
 The rule reads the query as the model wrote it, before the guard swaps tables for
 scoped subqueries. It qualifies it against the safe schema, so stars expand and
-every column has a source, and follows each column through CTEs, derived tables,
-set operations, UNNEST and subqueries (sqlglot scopes). It fails closed: anything
-it cannot trace or does not recognise, in a query that uses customer attributes,
-is rejected.
+every column has a source, and follows every value through CTEs, derived tables,
+set operations, UNNEST, windows and subqueries (sqlglot scopes). It fails closed:
+anything it cannot trace or does not recognise, in a query that uses customer
+attributes, is rejected.
 
 Free mode. Customer attributes exist only in `users` and `orders`. A query that
 never reaches one runs unchanged: customer lists by user_id with purchase metrics
 are allowed.
 
 Attribute mode, when any customer attribute is used anywhere (output, filter, join,
-grouping, ordering):
+grouping, ordering). "IDs" below are customer IDs and order / order-line IDs: an
+order ID points at one customer as surely as a user_id does.
 
 A1  No construct that can pack many customers or a whole record into one value:
     ARRAY_AGG, STRING_AGG, ARRAY(...), [...], STRUCT, TO_JSON(_STRING), FORMAT,
     SELECT AS STRUCT / VALUE, aggregates outside a small allowlist (one quantile,
-    APPROX_QUANTILES(x, n)[OFFSET(k)], is fine), functions sqlglot does not recognise. Whole-row references are rejected in every mode.
-A2  Customer IDs only join (a.id = b.user_id, id IN (SELECT user_id ...)), are
-    counted (COUNT, COUNT(DISTINCT), APPROX_COUNT_DISTINCT), group or pass through
-    a per-customer subquery. Never compared with a value, computed with or listed.
+    APPROX_QUANTILES(x, n)[OFFSET(k)], is fine), functions sqlglot does not
+    recognise. Whole-row references are rejected in every mode.
+A2  IDs only join (a.id = b.user_id, user_id IN (SELECT user_id ...) with a real
+    customer ID on the left), are counted (COUNT, COUNT(DISTINCT),
+    APPROX_COUNT_DISTINCT), group, partition or pass through a per-row subquery.
+    Never compared with a value, computed with or listed. A row number that is
+    not per customer counts as an ID.
 A3  A per-customer subquery is used as a table (FROM, JOIN, CTE) or on the right of
     `customer_id IN (...)`, never as a scalar or EXISTS subquery: only a table can
     be counted.
 A4  The result leaves only through aggregation across customers. A SELECT that
-    aggregates without grouping by a customer ID is a release point; the final
-    output may not be one row per customer (or per order, or per anything finer).
+    aggregates without grouping by an ID is a release point; the final output may
+    not be one row per customer, order or anything finer.
 A5  Each release point gets HAVING COUNT(DISTINCT <customer id>) >= 5 for every
     source of customer rows it reads, injected into the SQL that runs. A derived
     table is counted once per set of customers it carries (tables joined on
     customer ID by an inner join or WHERE are one set); a set with no customer ID
-    column to count is rejected. Smaller groups are dropped.
+    column, or rows merged by UNION from different customers, cannot be counted
+    and is rejected. Smaller groups are dropped.
+A6  Inside a release point an aggregate must read the whole group, not pick rows
+    out of it: a condition inside it (COUNTIF(c), SUM(IF(c, x, 0)),
+    COUNT(DISTINCT IF(c, id, NULL))) gets its own 5-customer check, and the cell is
+    NULL below it; other conditions, and non-linear functions of anything but
+    attributes, are rejected; MIN / MAX / ANY_VALUE / quantiles only over
+    attributes (a single price or date can be looked up to find its buyer); values
+    computed with a condition in an earlier per-customer step cannot be summed.
 
-What this does not stop: differencing two large aggregates, or groups chosen to
-isolate someone by other attributes. Production adds BigQuery's aggregation
+What this does not stop: differencing or reconstruction across several exact
+aggregates, or a chosen handful of orders picked by exact time or price (the
+threshold then applies to that handful). Production adds BigQuery's aggregation
 threshold or differential privacy (docs/technical-design.md §4).
 """
 
@@ -56,6 +69,11 @@ MIN_GROUP_CUSTOMERS = 5
 
 # The customer ID of each table whose rows belong to one customer.
 CUSTOMER_ID_COLUMN = {"users": "id", "orders": "user_id", "order_items": "user_id"}
+# Every column that points at one customer's row: customer, order and line IDs.
+ID_COLUMNS = frozenset({
+    *CUSTOMER_ID_COLUMN.items(),
+    ("orders", "order_id"), ("order_items", "order_id"), ("order_items", "id"), ("order_items", "inventory_item_id"),
+})
 
 ALLOWED_AGGREGATES = (
     exp.Count, exp.CountIf, exp.Sum, exp.Avg, exp.Min, exp.Max, exp.AnyValue,
@@ -65,6 +83,27 @@ ALLOWED_AGGREGATES = (
 PACKING = (exp.ArrayAgg, exp.GroupConcat, exp.ArrayConcatAgg, exp.Array, exp.Struct, exp.JSONFormat, exp.Format)
 # Scalar BigQuery functions sqlglot parses as Anonymous; any other unknown function is rejected.
 KNOWN_SCALARS = frozenset({"DATE_BUCKET", "DATETIME_BUCKET", "TIMESTAMP_BUCKET"})
+
+COUNTING = (exp.Count, exp.ApproxDistinct)
+SINGLE_VALUE = (exp.Min, exp.Max, exp.AnyValue, exp.ApproxQuantiles)  # return one row's value
+RANKING = (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Ntile, exp.PercentRank, exp.CumeDist)
+# Operations that cannot turn a value into a row selector: arithmetic, dates, casts to
+# numbers or dates, aggregates, and reading another row of the same window.
+LINEAR = (
+    exp.Column, exp.Literal, exp.Null, exp.Boolean, exp.Alias, exp.Paren, exp.Distinct, exp.Star,
+    exp.Add, exp.Sub, exp.Mul, exp.Neg, exp.DataType, exp.Var, exp.Interval,
+    exp.Date, exp.TsOrDsToDate, exp.TsOrDsToTimestamp, exp.DateTrunc, exp.TimestampTrunc, exp.DatetimeTrunc,
+    exp.TimeToStr, exp.Extract, exp.DateDiff, exp.TimestampDiff, exp.DatetimeDiff,
+    exp.DateAdd, exp.DateSub, exp.TimestampAdd, exp.TimestampSub, exp.DatetimeAdd, exp.DatetimeSub,
+    exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentDatetime,
+    exp.Sum, exp.Avg, exp.Min, exp.Max, exp.AnyValue, exp.Stddev, exp.StddevPop, exp.StddevSamp,
+    exp.Variance, exp.VariancePop, exp.Corr, exp.CovarPop, exp.CovarSamp, exp.LogicalAnd, exp.LogicalOr,
+    exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.NthValue, exp.IgnoreNulls, exp.RespectNulls,
+)
+NUMERIC_OR_DATE = {
+    exp.DataType.Type.DOUBLE, exp.DataType.Type.FLOAT, exp.DataType.Type.DECIMAL, exp.DataType.Type.BIGDECIMAL,
+    exp.DataType.Type.DATE, exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.DATETIME,
+}
 
 ATTRIBUTES_HELP = (
     "Customer attributes (city, state, country, age, gender, traffic_source) may only be used in "
@@ -85,21 +124,37 @@ class _Untraced(Exception):
 
 @dataclass(frozen=True)
 class Flow:
-    """What reaches a value at customer level, not yet released by an aggregate."""
+    """What a value is made of, at the level of individual rows (not yet released by an aggregate)."""
 
     attrs: frozenset[str] = frozenset()  # customer attribute columns
-    key: bool = False  # a customer ID, possibly inside an expression
-    pure_key: bool = False  # the value IS a customer ID
+    key: bool = False  # a customer ID reaches it
+    pure_key: bool = False  # it IS a customer ID
+    ident: bool = False  # a customer, order or line ID (or a row position) reaches it
+    other: bool = False  # another column reaches it: a price, a date, a status...
+    shaped: bool = False  # it went through a condition or a non-linear function of non-attribute data
 
-    def __or__(self, other: Flow) -> Flow:
-        return Flow(self.attrs | other.attrs, self.key or other.key, False)
+    def __or__(self, o: Flow) -> Flow:
+        return Flow(self.attrs | o.attrs, self.key or o.key, False, self.ident or o.ident,
+                    self.other or o.other, self.shaped or o.shaped)
 
     @property
     def tainted(self) -> bool:
-        return bool(self.attrs) or self.key
+        return bool(self.attrs) or self.key or self.ident
+
+    @property
+    def beyond_attributes(self) -> bool:
+        """Depends on something other than customer attributes and constants."""
+        return self.key or self.ident or self.other or self.shaped
 
 
 EMPTY = Flow()
+
+
+def _union(flows) -> Flow:
+    out = EMPTY
+    for f in flows:
+        out = out | f
+    return out
 
 
 @dataclass
@@ -109,13 +164,14 @@ class ScopeInfo:
     release: bool = False  # aggregates across customers
     linked_sources: list[str] = field(default_factory=list)
     # Linked scopes: one entry per set of customers the rows carry, naming the output
-    # columns that hold that set's customer ID. None: some set has no ID column.
+    # columns that hold that set's customer ID. None: some set cannot be counted.
     id_groups: list[list[str]] | None = None
+    merged: bool = False  # a set operation over customers' rows (cannot be counted)
 
 
 @dataclass
 class RuleResult:
-    tree: exp.Expression | None  # qualified tree with HAVING added; None = run the query as written
+    tree: exp.Expression | None  # qualified tree with checks added; None = run the query as written
     notes: tuple[str, ...] = ()
 
 
@@ -178,6 +234,7 @@ class _Analysis:
         self.infos: dict[int, ScopeInfo] = {}
         self.in_progress: set[int] = set()
         self.problems: list[tuple[str, str]] = []
+        self.cells: dict[int, list[tuple[exp.AggFunc, exp.Expression]]] = {}  # scope -> conditional aggregates
 
     def run(self) -> RuleResult:
         tree = self.root.expression
@@ -208,6 +265,9 @@ class _Analysis:
         except _Untraced:
             untraced.append("(a derived table)")
         if untraced:
+            self._check_constructs(tree)  # a clearer reason, when there is one
+            if self.problems:
+                raise Rejected(self.problems[0][0], " ".join(dict.fromkeys(m for _, m in self.problems)))
             raise Rejected("unverifiable",
                            f"{', '.join(sorted(set(untraced)))} could not be traced to a table, so the query cannot be "
                            "checked for customer privacy. Qualify every column with its table alias and avoid "
@@ -215,25 +275,33 @@ class _Analysis:
         if not any(f.attrs for f in flows.values()):
             return RuleResult(None)  # no customer attribute after all: free mode
 
-        self._check_constructs(tree)
-        for scope, col in columns.values():
-            if flows[id(col)].key and not self._key_use_allowed(scope, col):
-                self._add("customer_id_use",
-                          f"'{col.sql('bigquery')}' is a customer ID used in `{_context(col)}`. In a query that "
-                          "uses customer attributes, customer IDs may only join tables, be counted "
-                          "(COUNT(DISTINCT ...)) or group a per-customer subquery; never filter on, compute with "
-                          "or list specific customers.")
-        for scope in scopes:
-            if scope.scope_type == ScopeType.SUBQUERY and self._info(scope).linked and not self._semi_join(scope):
-                self._add("subquery",
-                          "A subquery over individual customers' rows is used as a value or EXISTS test. JOIN it as "
-                          "a table, or use `user_id IN (SELECT user_id ...)`, so group sizes can be counted.")
-        self._check_output(self.root)
-        injected = 0 if self.problems else self._inject(scopes)
+        try:
+            self._check_constructs(tree)
+            for scope, col in columns.values():
+                if flows[id(col)].ident and not self._id_use_allowed(scope, col):
+                    self._add("customer_id_use",
+                              f"'{col.sql('bigquery')}' is a customer or order ID used in `{_context(col)}`. In a "
+                              "query that uses customer attributes, IDs may only join tables, be counted "
+                              "(COUNT(DISTINCT ...)), group or partition; never filter on, compute with or list "
+                              "specific customers or orders.")
+            for scope in scopes:
+                info = self._info(scope)
+                if scope.scope_type == ScopeType.SUBQUERY and info.linked and not self._semi_join(scope):
+                    self._add("subquery",
+                              "A subquery over individual customers' rows is used as a value or EXISTS test (or with "
+                              "something other than a customer ID on the left of IN). JOIN it as a table, or use "
+                              "`user_id IN (SELECT user_id ...)`, so group sizes can be counted.")
+                if info.release and info.linked_sources:
+                    self.cells[id(scope)] = self._check_release_aggregates(scope)
+            self._check_output(self.root)
+            injected = 0 if self.problems else self._inject(scopes)
+        except _Untraced:
+            raise Rejected("unverifiable", "Part of the query could not be checked for customer privacy. Simplify it.") from None
         if self.problems:
             raise Rejected(self.problems[0][0], " ".join(dict.fromkeys(m for _, m in self.problems)))
         note = (f"Privacy rule: groups with fewer than {MIN_GROUP_CUSTOMERS} distinct customers are left out of this "
-                "result. Say so if a segment is missing.")
+                "result, and a conditional count or sum over fewer than that is blank (NULL). Say so if a segment "
+                "or figure is missing.")
         return RuleResult(tree, (note,) if injected else ())
 
     def _add(self, kind: str, message: str) -> None:
@@ -273,7 +341,10 @@ class _Analysis:
             if table not in self.rule.tables:  # a recursive CTE reading itself
                 raise _Untraced
             is_key = CUSTOMER_ID_COLUMN.get(table) == name
-            return Flow(frozenset({name}) if (table, name) in self.rule.attributes else frozenset(), is_key, is_key)
+            is_id = (table, name) in ID_COLUMNS
+            is_attr = (table, name) in self.rule.attributes
+            return Flow(frozenset({name}) if is_attr else frozenset(), is_key, is_key, is_id,
+                        other=not (is_attr or is_id))
         if isinstance(source, Scope):
             outputs = self._info(source).outputs
             if source.scope_type == ScopeType.UDTF:
@@ -297,20 +368,49 @@ class _Analysis:
         elif isinstance(expr, exp.Select):
             for proj in expr.selects:
                 if proj.alias_or_name.lower() == name:
-                    return self._expression_flow(scope, proj)
+                    return self._value(scope, proj)
         raise _Untraced
 
-    def _expression_flow(self, scope: Scope, node: exp.Expression) -> Flow:
-        inner = node.unalias() if isinstance(node, exp.Alias) else node
-        if isinstance(inner, exp.Column):
-            return self._trace(scope, inner)
-        flow = EMPTY
-        for col in _own_columns(node):
-            flow = flow | self._trace(scope, col)
-        for sub in _subquery_scopes_in(scope, node):
-            for out in self._info(sub).outputs.values():
-                flow = flow | out
+    def _value(self, scope: Scope, node: exp.Expression) -> Flow:
+        """The flow of an expression evaluated in `scope`, node by node."""
+        if isinstance(node, exp.Column):
+            if isinstance(node.this, exp.Star):
+                raise _Untraced
+            return self._trace(scope, node)
+        if isinstance(node, exp.Alias):
+            return self._value(scope, node.this)
+        if isinstance(node, exp.Subquery):  # a scalar subquery: what it returns
+            sub = next((s for s in scope.subquery_scopes if s.expression is node.this), None)
+            if sub is None:
+                raise _Untraced
+            return _union(self._info(sub).outputs.values())
+        if isinstance(node, exp.Window):
+            return self._window_value(scope, node)
+        if isinstance(node, exp.Select):  # ARRAY(SELECT ...), EXISTS(SELECT ...)
+            sub = next((s for s in scope.subquery_scopes if s.expression is node), None)
+            if sub is None:
+                raise _Untraced
+            return _union(self._info(sub).outputs.values()) | Flow(shaped=True)
+        flow = _union(self._value(scope, child) for child in node.iter_expressions())
+        if isinstance(node, (*COUNTING, exp.CountIf)):
+            # A count is a number, not an ID; counting rows picked by a condition is shaped.
+            shaped = flow.shaped or (isinstance(node, exp.CountIf) and flow.beyond_attributes)
+            return Flow(flow.attrs, other=flow.other or flow.ident or flow.key, shaped=shaped)
+        if not _linear(node) and flow.beyond_attributes:
+            flow = flow | Flow(shaped=True)
         return flow
+
+    def _window_value(self, scope: Scope, window: exp.Window) -> Flow:
+        func = window.this
+        while isinstance(func, (exp.IgnoreNulls, exp.RespectNulls)):
+            func = func.this
+        partition = window.args.get("partition_by") or []
+        if isinstance(func, RANKING):
+            if any(self._value(scope, p).pure_key for p in partition):
+                return Flow(other=True)  # a customer's 1st, 2nd... order
+            return Flow(ident=True, other=True)  # a position among all rows: as good as an ID
+        flow = self._value(scope, func)
+        return flow | Flow(attrs=_union(self._value(scope, p) for p in partition).attrs)
 
     def _info(self, scope: Scope) -> ScopeInfo:
         cached = self.infos.get(id(scope))
@@ -326,9 +426,8 @@ class _Analysis:
             elif isinstance(expr, exp.Select):
                 info = self._select_info(scope, expr)
             elif scope.scope_type == ScopeType.UDTF:
-                flow = EMPTY
-                for col in scope.columns:
-                    flow = flow | self._trace(scope, col)
+                flow = _union(self._value(scope, e) for e in expr.iter_expressions() if not isinstance(e, exp.TableAlias))
+                flow = Flow(flow.attrs, flow.key, False, flow.ident, flow.other, flow.shaped)
                 info = ScopeInfo({"*": flow}, linked=flow.tainted)
             else:
                 raise _Untraced
@@ -340,28 +439,28 @@ class _Analysis:
     def _set_operation_info(self, scope: Scope, expr: exp.SetOperation) -> ScopeInfo:
         branches = [self._info(b) for b in scope.set_operation_scopes]
         names = [n.lower() for n in _first_select(expr).named_selects]
+        if len(set(names)) != len(names):
+            raise _Untraced
         outputs = {}
         for i, name in enumerate(names):
             flows = [list(b.outputs.values())[i] for b in branches if i < len(b.outputs)]
-            merged = EMPTY
-            for f in flows:
-                merged = merged | f
+            merged = _union(flows)
             pure = len(flows) == len(branches) and all(f.pure_key for f in flows)
-            outputs[name] = Flow(merged.attrs, merged.key or pure, pure)
+            outputs[name] = Flow(merged.attrs, merged.key or pure, pure, merged.ident or pure, merged.other, merged.shaped)
         linked = any(b.linked for b in branches)
-        # Countable when every branch carries one set of customers, with its ID at the same position.
-        id_groups = None
-        if linked and all(b.id_groups is not None and len(b.id_groups) == 1 for b in branches):
-            for i, name in enumerate(names):
-                if all(i < len(b.outputs) and list(b.outputs)[i] in b.id_groups[0] for b in branches):
-                    id_groups = [[name]]
-                    break
-        return ScopeInfo(outputs, linked=linked, id_groups=id_groups)
+        # Never countable: a UNION can pad one customer's rows with other customers' IDs.
+        return ScopeInfo(outputs, linked=linked, id_groups=None, merged=linked)
 
     def _select_info(self, scope: Scope, select: exp.Select) -> ScopeInfo:
         linked_sources = [name for name, (_, source) in scope.selected_sources.items() if self._source_linked(source)]
+        names = [p.alias_or_name.lower() for p in select.selects]
+        # t.x would be ambiguous: which column is it? (A UNION's branches are read by position.)
+        if scope.scope_type != ScopeType.SET_OPERATION and len(set(names)) != len(names):
+            raise _Untraced
         group_keys = list(select.selects) if select.args.get("distinct") else []
         group = select.args.get("group")
+        if group and group.args.get("all"):  # GROUP BY ALL: every projection without an aggregate
+            group_keys += [p for p in select.selects if not _has_plain_aggregate_in(p, select)]
         for g in group.expressions if group else []:
             if isinstance(g, exp.Literal) and g.is_int and 0 < int(g.name) <= len(select.selects):
                 group_keys.append(select.selects[int(g.name) - 1])
@@ -373,9 +472,9 @@ class _Analysis:
             if part is not None
             for agg in part.find_all(exp.AggFunc)
         )
-        by_customer = any(self._expression_flow(scope, k).pure_key for k in group_keys)
-        release = aggregating and not by_customer
-        outputs = {p.alias_or_name.lower(): EMPTY if release else self._expression_flow(scope, p) for p in select.selects}
+        by_row = any(self._value(scope, k).ident for k in group_keys)  # per customer, order or line
+        release = aggregating and not by_row
+        outputs = {p.alias_or_name.lower(): EMPTY if release else self._value(scope, p) for p in select.selects}
         linked = not release and bool(linked_sources)
         info = ScopeInfo(outputs, linked=linked, release=release, linked_sources=linked_sources)
         if linked:
@@ -434,7 +533,7 @@ class _Analysis:
 
     # ------------------------------------------------------------------ A2 / A3
 
-    def _key_use_allowed(self, scope: Scope, col: exp.Column) -> bool:
+    def _id_use_allowed(self, scope: Scope, col: exp.Column) -> bool:
         node, parent = col, col.parent
         while isinstance(parent, exp.Paren):
             node, parent = parent, parent.parent
@@ -442,7 +541,9 @@ class _Analysis:
             return True
         if isinstance(parent, exp.Select) and node in parent.selects:
             return True
-        if isinstance(parent, (exp.Group, exp.Window, exp.Is)):
+        if isinstance(parent, (exp.Group, exp.Is)):
+            return True
+        if isinstance(parent, exp.Window) and any(node is p for p in parent.args.get("partition_by") or []):
             return True
         if isinstance(parent, exp.Ordered) and isinstance(parent.parent, (exp.Order, exp.Window)):
             return True
@@ -450,13 +551,13 @@ class _Analysis:
             other = parent.expression if parent.this is node else parent.this
             while isinstance(other, exp.Paren):
                 other = other.this
-            try:
-                return isinstance(other, exp.Column) and self._trace(scope, other).pure_key
-            except _Untraced:
+            if not isinstance(other, exp.Column):
                 return False
+            this_flow, other_flow = self._trace(scope, col), self._trace(scope, other)
+            return _is_pure_id(this_flow) and _is_pure_id(other_flow)
         if isinstance(parent, exp.In) and parent.this is node and parent.args.get("query") is not None:
             sub = next((s for s in scope.subquery_scopes if s.expression is parent.args["query"].this), None)
-            return sub is not None and self._one_customer_id(sub)
+            return sub is not None and self._trace(scope, col).pure_key and self._one_customer_id(sub)
         # The value of IF / CASE directly inside a count: COUNT(DISTINCT IF(cond, user_id, NULL)).
         while isinstance(parent, (exp.If, exp.Case, exp.Paren)) and _is_value_branch(parent, node):
             node, parent = parent, parent.parent
@@ -476,14 +577,53 @@ class _Analysis:
         )
 
     def _semi_join(self, scope: Scope) -> bool:
-        """`customer_id IN (SELECT customer_id ...)`."""
+        """`customer_id IN (SELECT customer_id ...)`, with a real customer ID on the left."""
         wrapper = scope.expression.parent
-        return (
-            isinstance(wrapper, exp.Subquery)
-            and isinstance(wrapper.parent, exp.In)
-            and wrapper.parent.args.get("query") is wrapper
-            and self._one_customer_id(scope)
-        )
+        if not (isinstance(wrapper, exp.Subquery) and isinstance(wrapper.parent, exp.In)
+                and wrapper.parent.args.get("query") is wrapper and self._one_customer_id(scope)):
+            return False
+        left = wrapper.parent.this
+        while isinstance(left, exp.Paren):
+            left = left.this
+        return isinstance(left, exp.Column) and scope.parent is not None and self._trace(scope.parent, left).pure_key
+
+    # ------------------------------------------------------------------ A6 aggregates at a release point
+
+    def _check_release_aggregates(self, scope: Scope) -> list[tuple[exp.AggFunc, exp.Expression]]:
+        """Each aggregate reads its whole group. Returns the conditional ones, which get their own
+        group-size check."""
+        select = scope.expression
+        cells = []
+        for agg in list(select.find_all(exp.AggFunc)):
+            if _windowed(agg) or _inside_subquery(agg, select) or (isinstance(agg, exp.Count) and isinstance(agg.this, exp.Star)):
+                continue
+            name = agg.sql_name()
+            cond, values = _conditional_parts(agg)
+            if cond is not None and self._value(scope, cond).beyond_attributes:
+                cells.append((agg, cond))
+            for value in values:
+                flow = self._value(scope, value)
+                inner = value.expressions[0] if isinstance(value, exp.Distinct) and len(value.expressions) == 1 else value
+                if isinstance(agg, COUNTING):
+                    ok = isinstance(inner, exp.Literal) or not flow.shaped and (
+                        isinstance(inner, exp.Column) or not flow.beyond_attributes)
+                elif isinstance(agg, SINGLE_VALUE) or _single_quantile(agg):
+                    ok = not flow.beyond_attributes
+                    if not ok:
+                        self._add("not_allowed",
+                                  f"{name} of `{_short(value)}` returns one row's exact value, which can be looked up "
+                                  "to find whose row it is. With customer attributes, use MIN / MAX / quantiles only "
+                                  "on the attributes themselves; use AVG or SUM for prices, dates and counts.")
+                        continue
+                else:
+                    ok = not (flow.shaped or flow.ident or flow.key)
+                if not ok:
+                    self._add("not_allowed",
+                              f"{name}(`{_short(value)}`) picks out particular rows inside its group. With customer "
+                              "attributes, filter rows in WHERE or GROUP BY, or use one condition per aggregate "
+                              "(COUNTIF(status = 'Returned'), SUM(IF(cond, sale_price, 0))) at the final "
+                              "aggregation, not in a per-customer step. IDs can only be counted.")
+        return cells
 
     # ------------------------------------------------------------------ A4 / A5
 
@@ -493,13 +633,13 @@ class _Analysis:
                 self._check_output(branch)
             return
         info = self._info(scope)
-        keys = sorted(n for n, f in info.outputs.items() if f.key)
+        ids = sorted(n for n, f in info.outputs.items() if f.key or f.ident)
         attrs = sorted({a for f in info.outputs.values() for a in f.attrs})
-        if keys:
+        if ids:
             self._add("customer_attributes",
-                      f"This result has one row per customer ({', '.join(keys)}) and uses customer attributes. "
-                      f"{ATTRIBUTES_HELP} List customers by ID only in a separate query that does not use these "
-                      "attributes at all (not even as a filter).")
+                      f"This result has one row per customer or order ({', '.join(ids)}) and uses customer "
+                      f"attributes. {ATTRIBUTES_HELP} List customers by ID only in a separate query that does not "
+                      "use these attributes at all (not even as a filter).")
         elif attrs:
             self._add("not_aggregated", f"Output column(s) show {', '.join(attrs)} row by row. {ATTRIBUTES_HELP}")
         elif info.linked:
@@ -508,7 +648,8 @@ class _Analysis:
                       f"customer attributes. {ATTRIBUTES_HELP}")
 
     def _inject(self, scopes: list[Scope]) -> int:
-        """HAVING COUNT(DISTINCT id) >= k for every set of customers each release point reads."""
+        """HAVING COUNT(DISTINCT id) >= k for every set of customers each release point reads, and the
+        same check per conditional aggregate (the cell is NULL below it)."""
         injected = 0
         for scope in scopes:
             info = self._info(scope)
@@ -523,7 +664,10 @@ class _Analysis:
                 else:
                     groups = self._info(source).id_groups
                 if groups is None:
+                    merged = isinstance(source, Scope) and self._info(source).merged
                     self._add("no_customer_id",
+                              f"'{alias}' merges customers' rows with UNION, so group sizes cannot be counted. "
+                              "Select the rows in one query (OR, IN, JOIN) instead." if merged else
                               f"'{alias}' holds individual customers' rows but not the customer ID of every table "
                               "it reads, so group sizes cannot be checked. Add user_id to its SELECT list (and GROUP "
                               "BY), and join its tables on customer ID.")
@@ -531,6 +675,14 @@ class _Analysis:
                 ids += [exp.column(cols[0], table=alias, quoted=True) for cols in groups]
             if self.problems:
                 continue
+            for agg, cond in self.cells.get(id(scope), []):
+                checks = [
+                    exp.GTE(this=exp.Count(this=exp.Distinct(expressions=[
+                        exp.If(this=cond.copy(), true=key.copy(), false=exp.Null())])),
+                        expression=exp.Literal.number(MIN_GROUP_CUSTOMERS))
+                    for key in ids
+                ]
+                agg.replace(exp.If(this=exp.and_(*checks), true=agg.copy(), false=exp.Null()))
             if select.args.get("distinct") and not select.args.get("group") and not _has_plain_aggregate(select):
                 if any(p.find(exp.Window) for p in select.selects):
                     self._add("not_allowed", "Use GROUP BY instead of SELECT DISTINCT with window functions here.")
@@ -555,6 +707,42 @@ def _resolve(scope: Scope | None, name: str):
     return None
 
 
+def _is_pure_id(flow: Flow) -> bool:
+    return flow.pure_key or (flow.ident and not (flow.attrs or flow.other or flow.shaped))
+
+
+def _linear(node: exp.Expression) -> bool:
+    if isinstance(node, (exp.Cast, exp.TryCast)):
+        return node.to.this in NUMERIC_OR_DATE
+    if isinstance(node, exp.Div):
+        return isinstance(node.expression, exp.Literal)
+    return isinstance(node, LINEAR)
+
+
+def _conditional_parts(agg: exp.AggFunc) -> tuple[exp.Expression | None, list[exp.Expression]]:
+    """(condition, values) of an aggregate: COUNTIF(c) -> (c, []); SUM(IF(c, x, 0)) -> (c, [x]);
+    COUNT(DISTINCT IF(c, id, NULL)) -> (c, [id]); anything else -> (None, its arguments)."""
+    if isinstance(agg, exp.CountIf):
+        return agg.this, []
+    args = [a for a in agg.iter_expressions() if not (isinstance(agg, exp.ApproxQuantiles) and a is not agg.this)]
+    first = agg.this
+    distinct = isinstance(first, exp.Distinct) and len(first.expressions) == 1
+    inner = first.expressions[0] if distinct else first
+    cond = value = None
+    if isinstance(inner, exp.If) and _blank(inner.args.get("false")):
+        cond, value = inner.this, inner.args.get("true")
+    elif (isinstance(inner, exp.Case) and not inner.this and len(inner.args.get("ifs") or []) == 1
+          and _blank(inner.args.get("default"))):
+        cond, value = inner.args["ifs"][0].this, inner.args["ifs"][0].args.get("true")
+    if cond is None or value is None:
+        return None, args
+    return cond, [value] + [a for a in args if a is not first]
+
+
+def _blank(e: exp.Expression | None) -> bool:
+    return e is None or isinstance(e, exp.Null) or (isinstance(e, exp.Literal) and e.is_number and float(e.name) == 0)
+
+
 def _windowed(agg: exp.Expression) -> bool:
     node = agg
     while isinstance(node.parent, (exp.IgnoreNulls, exp.RespectNulls)):
@@ -575,7 +763,11 @@ def _single_quantile(agg: exp.Expression) -> bool:
 
 
 def _has_plain_aggregate(select: exp.Select) -> bool:
-    return any(not _windowed(a) and not _inside_subquery(a, select) for p in select.selects for a in p.find_all(exp.AggFunc))
+    return any(_has_plain_aggregate_in(p, select) for p in select.selects)
+
+
+def _has_plain_aggregate_in(node: exp.Expression, select: exp.Select) -> bool:
+    return any(not _windowed(a) and not _inside_subquery(a, select) for a in node.find_all(exp.AggFunc))
 
 
 def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
@@ -585,15 +777,6 @@ def _inside_subquery(node: exp.Expression, root: exp.Expression) -> bool:
             return True
         parent = parent.parent
     return False
-
-
-def _own_columns(node: exp.Expression) -> list[exp.Column]:
-    return [c for c in node.find_all(exp.Column) if not _inside_subquery(c, node)]
-
-
-def _subquery_scopes_in(scope: Scope, node: exp.Expression) -> list[Scope]:
-    inner = {id(s.this) for s in node.find_all(exp.Subquery)}
-    return [s for s in scope.subquery_scopes if id(s.expression) in inner]
 
 
 def _first_select(expr: exp.Expression) -> exp.Select:
@@ -622,9 +805,13 @@ def _is_value_branch(parent: exp.Expression, child: exp.Expression) -> bool:
     return False
 
 
+def _short(node: exp.Expression, limit: int = 80) -> str:
+    text = node.sql("bigquery")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _context(col: exp.Column) -> str:
     node = col
     while node.parent is not None and not isinstance(node.parent, (exp.Select, exp.Where, exp.Join, exp.Having, exp.Group)):
         node = node.parent
-    text = node.sql("bigquery")
-    return text if len(text) <= 120 else text[:119] + "…"
+    return _short(node, 120)

@@ -222,7 +222,30 @@ U, I, O = USERS, ITEMS, ORDERS
         (f"SELECT u.state, COUNT(*) FROM {U} u WHERE u.id IN (SELECT a.id FROM {U} a CROSS JOIN {U} b WHERE b.age = 93 AND a.state = b.state) GROUP BY 1", "customer_id_use"),
         (f"SELECT state, COUNT(*) FROM (SELECT id, state FROM {U} WHERE age = 93 UNION ALL SELECT 1, 'Texas' UNION ALL SELECT 2, 'Texas') GROUP BY state", "no_customer_id"),
         (f"WITH tx AS (SELECT oi.sale_price FROM {I} oi JOIN {U} u ON u.id = oi.user_id WHERE u.age = 93) SELECT SUM(sale_price) FROM tx", "no_customer_id"),
+        # second review: an aggregate that reads one row of a large group
+        (f"SELECT MAX(IF(o.order_id = 1, o.gender, NULL)) g, MAX(IF(o.order_id = 1, u.state, NULL)) st FROM {O} o JOIN {U} u ON u.id = o.user_id", "customer_id_use"),
+        (f"WITH r AS (SELECT o.user_id, u.state, ROW_NUMBER() OVER (ORDER BY o.created_at) rn FROM {O} o JOIN {U} u ON u.id = o.user_id) "
+         f"SELECT DIV(rn, 8) b, COUNTIF(state = 'Texas') FROM r GROUP BY 1", "customer_id_use"),
+        (f"SELECT SUM(u.age * IF(o.created_at = TIMESTAMP '2024-01-01 10:00:00', 1000000, 1)) FROM {O} o JOIN {U} u ON u.id = o.user_id", "not_allowed"),
+        (f"SELECT u.state, SUM(1 / (ABS(oi.sale_price - 99.99) * 1000 + 1)) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1", "not_allowed"),
+        (f"SELECT u.state, MAX(oi.sale_price) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1", "not_allowed"),
+        (f"WITH c AS (SELECT u.id, u.state, COUNTIF(o.created_at = TIMESTAMP '2024-01-01 10:00:00') x FROM {O} o "
+         f"JOIN {U} u ON u.id = o.user_id GROUP BY u.id, u.state) SELECT state, SUM(x) FROM c GROUP BY state", "not_allowed"),
+        # second review: UNION pads a group with other customers' IDs
+        (f"WITH t AS (SELECT u.id p, u.state st, u.id q FROM {U} u UNION ALL SELECT oi.user_id, 'Tokyo', oi.user_id FROM {I} oi) "
+         f"SELECT st, COUNT(*) FROM t GROUP BY st", "no_customer_id"),
+        (f"WITH t AS (SELECT u.id p, u.state st FROM {U} u UNION ALL SELECT oi.user_id, NULL FROM {I} oi) SELECT t.p, MAX(t.st) FROM t GROUP BY t.p", "customer_attributes"),
+        (f"SELECT state, COUNT(*) FROM (SELECT id, state FROM {U} UNION ALL SELECT id, state FROM {U}) GROUP BY state", "no_customer_id"),
+        # second review: IN (customer subquery) with something else on the left
+        (f"SELECT n FROM UNNEST(GENERATE_ARRAY(1, 1000)) n WHERE n IN (SELECT u.id FROM {U} u WHERE u.state = 'Texas')", "subquery"),
+        (f"SELECT n customer_id, k age FROM UNNEST(GENERATE_ARRAY(1, 1000)) n CROSS JOIN UNNEST(GENERATE_ARRAY(0, 120)) k "
+         f"WHERE n IN (SELECT u.id FROM {U} u WHERE u.age = k)", "subquery"),
+        # a per-order table without the customer ID cannot be counted (it used to return 0 rows silently)
+        (f"WITH po AS (SELECT oi.order_id, u.gender, SUM(oi.sale_price) total FROM {I} oi JOIN {U} u ON u.id = oi.user_id "
+         f"GROUP BY oi.order_id, u.gender) SELECT gender, AVG(total) FROM po GROUP BY 1", "no_customer_id"),
+        (f"SELECT oi.user_id, MAX(u.state) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY ALL", "customer_attributes"),
         # what cannot be traced is rejected
+        (f"SELECT t.x, COUNT(*) FROM (SELECT u.id AS x, u.state AS x FROM {U} u) t GROUP BY t.x", "unverifiable"),
         (f"WITH RECURSIVE r AS (SELECT u.id, u.state FROM {U} u UNION ALL SELECT r.id, r.state FROM r WHERE FALSE) SELECT state, COUNT(*) FROM r GROUP BY 1", "unverifiable"),
         (f"SELECT * FROM (SELECT id, state, city FROM {U}) UNPIVOT(v FOR k IN (state, city))", "unverifiable"),
     ],
@@ -251,9 +274,20 @@ def test_customer_attributes_rejected(guard, sql, kind):
         f"SELECT u.gender, COUNT(DISTINCT IF(u.state = 'Texas', u.id, NULL)) AS texans FROM {U} u GROUP BY 1",
         f"SELECT u.state, COUNT(*) AS n, SUM(COUNT(*)) OVER () AS total FROM {U} u GROUP BY 1",
         f"SELECT u.state, APPROX_QUANTILES(u.age, 2)[OFFSET(1)] AS median_age FROM {U} u GROUP BY 1",
+        # conditional aggregates (each gets its own 5-customer check), windows per customer, per-order tables
+        f"SELECT u.gender, SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'), COUNTIF(oi.status IN ('Complete', 'Returned'))) AS rr "
+        f"FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1",
+        f"WITH f AS (SELECT o.user_id, o.gender, ROW_NUMBER() OVER (PARTITION BY o.user_id ORDER BY o.created_at) rn FROM {O} o) "
+        f"SELECT f.gender, COUNTIF(f.rn = 1) AS new_orders FROM f GROUP BY 1",
+        f"WITH g AS (SELECT o.user_id, o.gender, DATE_DIFF(DATE(o.created_at), LAG(DATE(o.created_at)) OVER "
+        f"(PARTITION BY o.user_id ORDER BY o.created_at), DAY) gap FROM {O} o) SELECT g.gender, AVG(g.gap) FROM g GROUP BY 1",
+        f"WITH po AS (SELECT oi.order_id, oi.user_id, u.gender, SUM(oi.sale_price) total FROM {I} oi JOIN {U} u ON u.id = oi.user_id "
+        f"GROUP BY oi.order_id, oi.user_id, u.gender) SELECT gender, AVG(total) AS aov FROM po GROUP BY 1",
+        f"WITH c AS (SELECT o.user_id, MIN(DATE(o.created_at)) first_order FROM {O} o GROUP BY 1) SELECT u.state, "
+        f"AVG(DATE_DIFF(CURRENT_DATE(), c.first_order, DAY)) AS tenure FROM c JOIN {U} u ON u.id = c.user_id GROUP BY 1",
+        f"(SELECT u.state, COUNT(*) AS n FROM {U} u GROUP BY 1)",
         f"SELECT p.category, COUNT(*) FROM {I} oi JOIN {PRODUCTS} p ON p.id = oi.product_id "
         f"WHERE oi.user_id IN (SELECT id FROM {U} WHERE age > 60) GROUP BY 1",
-        f"SELECT state, COUNT(*) FROM (SELECT id, state FROM {U} UNION ALL SELECT id, state FROM {U}) GROUP BY state",
         # an already-aggregated table can be read row by row
         f"SELECT x.state, x.n FROM (SELECT state, COUNT(*) AS n FROM {U} GROUP BY 1) x ORDER BY x.n DESC",
     ],
@@ -298,3 +332,23 @@ def test_small_groups_are_left_out(guard, sample_db):
 def test_apostrophes_in_brand_scope_are_escaped(guard):
     guarded = guard.prepare(f"SELECT COUNT(*) FROM {PRODUCTS}", BRANDS)
     assert "Levi\\'s" in guarded.sql
+
+
+def test_a_conditional_cell_over_few_customers_is_blank(guard, sample_db):
+    from retail_agent.data.warehouse import DuckDBWarehouse
+
+    warehouse = DuckDBWarehouse(sample_db, "bigquery-public-data.thelook_ecommerce")
+    first = warehouse.conn.execute("SELECT CAST(created_at AS VARCHAR) FROM orders ORDER BY order_id LIMIT 1").fetchone()[0]
+    one_order = (f"SELECT MAX(IF(o.created_at = TIMESTAMP '{first}', u.state, NULL)) AS st, "
+                 f"COUNTIF(o.created_at = TIMESTAMP '{first}') AS hits, COUNT(*) AS n FROM {O} o JOIN {U} u ON u.id = o.user_id")
+    row = warehouse.query(guard.prepare(one_order, ALL).sql, labels={}, max_rows=1).rows[0]
+    assert row[0] is None and row[1] is None and row[2] > 100  # the whole table is there; the one-order cells are not
+    returns = (f"SELECT u.gender, COUNTIF(oi.status = 'Returned') AS returned FROM {I} oi "
+               f"JOIN {U} u ON u.id = oi.user_id GROUP BY 1")
+    assert all(r[1] is not None for r in warehouse.query(guard.prepare(returns, ALL).sql, labels={}, max_rows=5).rows)
+
+
+def test_deep_nesting_is_rejected_not_crashed(guard):
+    with pytest.raises(SqlRejected) as err:
+        guard.prepare("SELECT " + "(" * 200 + "1" + ")" * 200, ALL)
+    assert err.value.kind == "invalid_sql"
