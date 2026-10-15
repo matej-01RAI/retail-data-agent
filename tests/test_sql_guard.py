@@ -264,6 +264,23 @@ U, I, O = USERS, ITEMS, ORDERS
         (f"SELECT u.state, SUM(oi.sale_price - 99.99 + 0.000001) FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY 1", "not_allowed"),
         (f"WITH f AS (SELECT o.user_id, o.gender, ROW_NUMBER() OVER (PARTITION BY o.user_id ORDER BY o.created_at) rn FROM {O} o) "
          f"SELECT f.gender, COUNTIF(f.rn = 1) AS new_orders FROM f GROUP BY 1", "not_allowed"),
+        # fourth review: a CTE mixing two customers per row through a product (or renamed) key,
+        # picking a customer by ID in a customer-set CTE, padding a MIN with known extremes
+        (f"WITH base AS (SELECT oi.user_id, oi.status AS product_id, oi.created_at, oi.sale_price, u.state, u.city, u.age "
+         f"FROM {I} oi JOIN {U} u ON u.id = oi.user_id), mix AS (SELECT a.user_id, b.created_at, b.sale_price, b.state, "
+         f"b.city, b.age FROM base a JOIN base b ON a.product_id = b.product_id) "
+         f"SELECT m.created_at, m.sale_price, m.state, m.city, m.age, COUNT(*) n FROM mix m GROUP BY 1, 2, 3, 4, 5", "join"),
+        (f"WITH mix AS (SELECT a.user_id, u.state, u.age FROM {I} a JOIN {I} b ON a.product_id = b.product_id "
+         f"JOIN {U} u ON u.id = b.user_id) SELECT m.state, m.age, COUNT(DISTINCT m.user_id) n FROM mix m GROUP BY 1, 2", "join"),
+        (f"WITH target AS (SELECT oi.user_id FROM {I} oi GROUP BY oi.user_id HAVING oi.user_id = 377) "
+         f"SELECT u.state, COUNT(*) FROM target t JOIN {U} u ON u.id = t.user_id GROUP BY 1", "customer_id_use"),
+        (f"WITH t AS (SELECT oi.user_id FROM {I} oi JOIN {U} u ON u.id = oi.user_id GROUP BY oi.user_id "
+         f"HAVING MIN(u.age) = 14 OR MIN(u.state) > 'S') SELECT MIN(u.state) FROM t JOIN {U} u ON u.id = t.user_id", "not_allowed"),
+        (f"SELECT MIN(u.age) FROM {U} u WHERE u.created_at = TIMESTAMP '2025-04-06 07:25:34' OR u.age > 60", "not_allowed"),
+        (f"SELECT u.state, COUNT(*) - COUNTIF(u.age = 60) FROM {U} u WHERE u.created_at = TIMESTAMP '2025-04-06 07:25:34' "
+         f"OR u.age = 60 GROUP BY 1", "not_allowed"),
+        (f"SELECT u.state, COUNTIF(NOT (u.created_at != TIMESTAMP '2025-04-06 07:25:34' AND u.age != 60)) FROM {U} u GROUP BY 1", "not_allowed"),
+        (f"SELECT IF(u.created_at = TIMESTAMP '2025-04-06 07:25:34' OR u.age = 60, 'x', 'y') g, AVG(u.age) FROM {U} u GROUP BY 1", "customer_attributes"),
         # what cannot be traced is rejected
         (f"SELECT t.x, COUNT(*) FROM (SELECT u.id AS x, u.state AS x FROM {U} u) t GROUP BY t.x", "unverifiable"),
         (f"WITH RECURSIVE r AS (SELECT u.id, u.state FROM {U} u UNION ALL SELECT r.id, r.state FROM r WHERE FALSE) SELECT state, COUNT(*) FROM r GROUP BY 1", "unverifiable"),
@@ -343,6 +360,12 @@ def test_rejections_tell_the_model_what_to_do(guard, sql, kind, says):
         f"WITH done AS (SELECT oi.user_id, oi.sale_price FROM {I} oi WHERE oi.status = 'Complete') "
         f"SELECT u.country, SUM(done.sale_price) FROM done JOIN {U} u ON u.id = done.user_id GROUP BY 1",
         f"(SELECT u.state, COUNT(*) AS n FROM {U} u GROUP BY 1)",
+        f"(SELECT u.state, COUNT(*) AS n FROM {U} u GROUP BY 1) ORDER BY n DESC LIMIT 3",
+        # comma join with the key in WHERE, ROLLUP, hour-level durations, NOT IN and one-column OR
+        f"SELECT u.state, COUNT(*) FROM {U} u, {I} oi WHERE u.id = oi.user_id AND oi.status NOT IN ('Cancelled') GROUP BY 1",
+        f"SELECT u.country, u.gender, COUNT(*) AS n FROM {U} u GROUP BY ROLLUP (u.country, u.gender)",
+        f"SELECT u.country, AVG(TIMESTAMP_DIFF(o.shipped_at, o.created_at, HOUR)) AS ship_hours FROM {O} o "
+        f"JOIN {U} u ON u.id = o.user_id WHERE o.status = 'Complete' OR o.status = 'Shipped' GROUP BY 1",
         f"SELECT p.category, COUNT(*) FROM {I} oi JOIN {PRODUCTS} p ON p.id = oi.product_id "
         f"JOIN {U} u ON u.id = oi.user_id WHERE u.age > 60 GROUP BY 1",
         # an already-aggregated table can be read row by row
@@ -417,6 +440,8 @@ def test_deep_nesting_is_rejected_not_crashed(guard):
         f"SELECT COUNT(*) FROM ({USERS} u JOIN {ITEMS} oi ON oi.user_id = u.id)",
         f"SELECT COUNT(*) FROM {USERS} u TABLESAMPLE SYSTEM (10 PERCENT)",
         f"SELECT COUNT(*) FILTER (WHERE status = 'Complete') FROM {ORDERS}",
+        "SELECT 'abc",
+        "SELECT 1 /* never closed",
     ],
 )
 def test_syntax_the_rewrite_cannot_keep_is_rejected(guard, sql):

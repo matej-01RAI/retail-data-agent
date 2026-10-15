@@ -27,7 +27,12 @@ that uses an attribute must have this shape:
   Never an ID (customer, order, order line): those give one row per person.
 - Joins: on key relationships (u.id = oi.user_id, o.order_id = oi.order_id,
   oi.product_id = p.id...); an inner join may add filters, an outer join may not.
-- Filters: anything but IDs (an ID may only be tested IS NULL).
+  Only customer and order keys make two tables' rows one customer's.
+- Filters (WHERE, join filters, conditions inside aggregates): comparisons of a
+  column with values, combined with AND; OR only between values of one column.
+  So a filter can narrow a group but never add "this person OR people I know"
+  to it. IDs only in joins or IS NULL. Dimensions may use CASE / IF only over one
+  column (bands).
 - Aggregates: COUNT(*), COUNT(DISTINCT any column), SUM / AVG / STDDEV of plain
   amounts (columns combined with + - *, scaled by a constant, or day-level date
   differences), MIN / MAX / one quantile of attributes only, and at most one
@@ -72,6 +77,14 @@ OTHER_IDS = {
     ("order_items", "id"): "line", ("order_items", "inventory_item_id"): "inventory",
 }
 ID_KINDS = frozenset({"key", "order", "line", "inventory"})
+# A product key joins order lines to products; it never makes two customers' rows one.
+PRODUCT_KEYS = frozenset({("order_items", "product_id"), ("products", "id")})
+# Wrappers a filter may put around a column: dates truncated, text case-folded.
+COLUMN_WRAPPERS = (exp.Date, exp.TsOrDsToDate, exp.DateTrunc, exp.TimestampTrunc, exp.DatetimeTrunc, exp.TimeToStr,
+                   exp.Lower, exp.Upper)
+COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Like, exp.ILike)
+CONDITIONAL = (exp.If, exp.Case, exp.Predicate, exp.Connector, exp.Not, exp.Coalesce, exp.Nullif, exp.Greatest,
+               exp.Least, exp.CountIf)
 
 ALLOWED_AGGREGATES = (
     exp.Count, exp.CountIf, exp.Sum, exp.Avg, exp.Min, exp.Max, exp.AnyValue,
@@ -150,6 +163,8 @@ class AggregateOnlyRule:
                     cls = "key"
                 elif (t, name) in OTHER_IDS:
                     cls = OTHER_IDS[(t, name)]
+                elif (t, name) in PRODUCT_KEYS:
+                    cls = "product"
                 elif c.aggregate_only:
                     cls = "attr"
                 elif kind in TIME_TYPES:
@@ -410,8 +425,8 @@ class _Checker:
             for conjunct in _conjuncts(join.args.get("on")):
                 relation = self._relationship(scope, conjunct)
                 if relation:
-                    a, b = relation
-                    if a in parent and b in parent:
+                    a, b, kind = relation
+                    if kind in ID_KINDS and a in parent and b in parent:
                         parent[find(a)] = find(b)
                     continue
                 if outer:
@@ -422,15 +437,16 @@ class _Checker:
         where = select.args.get("where")
         for conjunct in _conjuncts(where.this if where else None):
             relation = self._relationship(scope, conjunct)
-            if relation and relation[0] in parent and relation[1] in parent:
+            if relation and relation[2] in ID_KINDS and relation[0] in parent and relation[1] in parent:
                 parent[find(relation[0])] = find(relation[1])
         if one_customer and len({find(a) for a in linked}) > 1:
             self._add("join", "A CTE may combine customer tables only through their keys (user_id, order_id), so "
                               f"that each row is one customer's. {SHAPE_HELP}")
         return linked
 
-    def _relationship(self, scope: Scope, cond: exp.Expression) -> tuple[str, str] | None:
-        """`a.x = b.y` where x and y are IDs of the same kind (or a product key): returns (a, b)."""
+    def _relationship(self, scope: Scope, cond: exp.Expression) -> tuple[str, str, str] | None:
+        """`a.x = b.y` where x and y are keys of the same kind: returns (a, b, kind). Kinds come from
+        the column's real source table, never from its name."""
         cond = _strip(cond)
         if not isinstance(cond, exp.EQ):
             return None
@@ -438,10 +454,8 @@ class _Checker:
         if not (isinstance(left, exp.Column) and isinstance(right, exp.Column) and left.table and right.table):
             return None
         lc, rc = self._class(scope, left), self._class(scope, right)
-        if lc in ID_KINDS and lc == rc:
-            return left.table, right.table
-        if lc == rc == "cat" and {left.name.lower(), right.name.lower()} <= {"id", "product_id"}:
-            return left.table, right.table  # order_items.product_id = products.id (not a customer link)
+        if lc == rc and (lc in ID_KINDS or lc == "product"):
+            return left.table, right.table, lc
         return None
 
     # ------------------------------------------------------------------ expressions
@@ -454,6 +468,8 @@ class _Checker:
         return not node.find(exp.AggFunc, exp.Window, exp.Subquery, exp.Select)
 
     def _check_predicate(self, scope: Scope, node: exp.Expression, where: str) -> None:
+        """Comparisons of a column with values, ANDed; OR only between values of one column. A filter
+        can narrow a group, never add 'this person OR people whose attributes I know' to it."""
         if not self._scalar(node):
             self._add("not_allowed", f"A {where} may not contain aggregates, windows or subqueries. {SHAPE_HELP}")
             return
@@ -461,14 +477,60 @@ class _Checker:
             parent = col.parent
             while isinstance(parent, exp.Paren):
                 parent = parent.parent
-            if not isinstance(parent, exp.Is):
+            if not isinstance(parent, exp.Is) and not (isinstance(parent, exp.EQ) and self._relationship(scope, parent)):
                 self._add("customer_id_use",
                           f"'{col.sql('bigquery')}' is a customer or order ID used in a {where}. With customer "
                           "attributes, IDs may only join tables or be counted; never filter on specific customers "
                           "or orders (only `IS NULL` is allowed).")
+        for conjunct in _conjuncts(node):
+            if not self._atom(scope, conjunct, allow_or=True):
+                self._add("not_allowed",
+                          f"Keep the {where} simple: `{_short(conjunct)}` is not a comparison of one column with "
+                          "values. Use comparisons (=, <, IN, BETWEEN, LIKE, IS NULL) combined with AND; OR only "
+                          "between values of the same column.")
+
+    def _atom(self, scope: Scope, node: exp.Expression, allow_or: bool) -> bool:
+        node = _strip(node)
+        if isinstance(node, exp.Or):
+            parts = _disjuncts(node)
+            columns = {c.sql() for p in parts for c in p.find_all(exp.Column)}
+            return allow_or and len(columns) <= 1 and all(self._atom(scope, p, allow_or=False) for p in parts)
+        if isinstance(node, exp.Not):
+            return self._atom(scope, node.this, allow_or=False)
+        if self._relationship(scope, node):
+            return True
+        if isinstance(node, exp.Is):
+            return self._simple(node.this)
+        if isinstance(node, exp.In):
+            return (self._simple(node.this) and not node.args.get("query")
+                    and all(_constant(e) for e in node.expressions))
+        if isinstance(node, exp.Between):
+            return self._simple(node.this) and _constant(node.args.get("low")) and _constant(node.args.get("high"))
+        if isinstance(node, COMPARISONS):
+            return self._simple(node.this) and self._simple(node.expression)
+        return isinstance(node, exp.Boolean)
+
+    @staticmethod
+    def _simple(node: exp.Expression | None) -> bool:
+        """A column (maybe truncated to a date or case-folded) or a constant."""
+        node = _strip(node)
+        if node is None:
+            return False
+        if _constant(node):
+            return True
+        while isinstance(node, (*COLUMN_WRAPPERS, exp.Extract, exp.Cast)):
+            if isinstance(node, exp.Cast) and node.to.this not in (exp.DataType.Type.DATE, exp.DataType.Type.TEXT):
+                return False
+            node = _strip(node.expression if isinstance(node, exp.Extract) else node.this)
+        return isinstance(node, exp.Column)
 
     def _dimension(self, scope: Scope, node: exp.Expression) -> bool:
-        return self._scalar(node) and not self._ids_in(scope, node)
+        """Anything without IDs; conditions (CASE, IF, comparisons) only over a single column (bands)."""
+        if not self._scalar(node) or self._ids_in(scope, node):
+            return False
+        if node.find(*CONDITIONAL):
+            return len({c.sql() for c in node.find_all(exp.Column)}) <= 1
+        return True
 
     def _amount(self, scope: Scope, node: exp.Expression, whole: bool = True) -> bool:
         """What SUM / AVG may add up: amounts combined with + - *, scaled by a constant, and day-level
@@ -495,7 +557,11 @@ class _Checker:
         if isinstance(node, DIFFS):
             unit = node.args.get("unit")
             unit_name = (unit.name if unit is not None else "DAY").upper()
-            return unit_name in COARSE_UNITS and self._date_arg(scope, node.this) and self._date_arg(scope, node.expression)
+            # Hours only between two of the row's own times (shipping, delivery): an age measured against
+            # now in hours or seconds is precise enough to tell customers apart in a sum.
+            hourly = unit_name == "HOUR" and not any(isinstance(_strip(a), NOW) for a in (node.this, node.expression))
+            return ((unit_name in COARSE_UNITS or hourly)
+                    and self._date_arg(scope, node.this) and self._date_arg(scope, node.expression))
         return False
 
     def _date_arg(self, scope: Scope, node: exp.Expression) -> bool:
@@ -528,14 +594,40 @@ class _Checker:
                           "A per-customer CTE may only pick a set of customers: SELECT user_id ... GROUP BY user_id "
                           "[HAVING ...] [ORDER BY ... LIMIT n]. Per-customer figures cannot be carried into a query "
                           f"that uses customer attributes. {SHAPE_HELP}")
-            for part in (select.args.get("having"), select.args.get("order")):
-                if part is not None and part.find(exp.Subquery, exp.Select, exp.Window):
-                    self._add("not_allowed", "Subqueries and windows are not allowed in a customer-set CTE.")
+            self._check_segment_ranking(scope, select)
             return Step("segment", {select.selects[0].alias_or_name.lower(): "key"}, True)
         reads_customers = self._check_release(scope, select)
         # Aggregated across customers (and checked when it read customers' rows): no longer row-level.
         del reads_customers
         return Step("released", {p.alias_or_name.lower(): "released" for p in select.selects}, linked=False)
+
+    def _check_segment_ranking(self, scope: Scope, select: exp.Select) -> None:
+        """HAVING / ORDER BY of a customer set: per-customer aggregates of plain values compared with
+        constants, ANDed. No IDs (but COUNT of them), no conditions inside the aggregates."""
+        having, order = select.args.get("having"), select.args.get("order")
+        for part in (having, order):
+            if part is None:
+                continue
+            if part.find(exp.Subquery, exp.Select, exp.Window):
+                self._add("not_allowed", "Subqueries and windows are not allowed in a customer-set CTE.")
+            for agg in part.find_all(exp.AggFunc):
+                inner = agg.this.expressions[0] if isinstance(agg.this, exp.Distinct) else agg.this
+                if isinstance(agg, (exp.Count, exp.ApproxDistinct)) and isinstance(inner, (exp.Column, exp.Star)):
+                    continue
+                if inner is None or inner.find(*CONDITIONAL) or self._ids_in(scope, inner) or not self._scalar(inner):
+                    self._add("not_allowed",
+                              f"`{_short(agg)}` in a customer-set CTE may only aggregate a plain column or amount "
+                              "(no conditions, no IDs except inside COUNT).")
+            outside = [c for c in part.find_all(exp.Column) if not c.find_ancestor(exp.AggFunc)]
+            if any(self._class(scope, c) in ID_KINDS for c in outside if c.table):
+                self._add("customer_id_use", "A customer-set CTE may not pick customers by ID.")
+        for conjunct in _conjuncts(having.this if having else None):
+            node = _strip(conjunct)
+            if isinstance(node, exp.Not):
+                node = _strip(node.this)
+            if not (isinstance(node, (*COMPARISONS, exp.Between, exp.In, exp.Is)) and not node.find(exp.Or)):
+                self._add("not_allowed", "HAVING in a customer-set CTE: comparisons of aggregates with values, "
+                                         "combined with AND.")
 
     def _check_rows_step(self, scope: Scope, select: exp.Select) -> Step:
         linked = self._check_joins(scope, select, one_customer=True)
@@ -714,7 +806,13 @@ def _group_keys(select: exp.Select) -> list[exp.Expression]:
         return keys
     if group.args.get("all"):
         keys += [p.unalias() for p in select.selects if not _has_plain_aggregate_in(p, select)]
-    for g in group.expressions:
+    expressions = []
+    for g in group.expressions:  # ROLLUP / CUBE / GROUPING SETS: their columns are the keys
+        if isinstance(g, (exp.Rollup, exp.Cube, exp.GroupingSets)):
+            expressions += [e for item in g.expressions for e in (item.expressions if isinstance(item, exp.Tuple) else [item])]
+        else:
+            expressions.append(g)
+    for g in expressions:
         if isinstance(g, exp.Literal) and g.is_int and 0 < int(g.name) <= len(select.selects):
             keys.append(select.selects[int(g.name) - 1].unalias())
         elif isinstance(g, exp.Column) and not g.table:
@@ -801,6 +899,18 @@ def _first_select(expr: exp.Expression) -> exp.Select:
     while isinstance(expr, (exp.SetOperation, exp.Subquery)):
         expr = expr.this
     return expr
+
+
+def _disjuncts(cond: exp.Expression) -> list[exp.Expression]:
+    cond = _strip(cond)
+    if isinstance(cond, exp.Or):
+        return _disjuncts(cond.this) + _disjuncts(cond.expression)
+    return [cond]
+
+
+def _constant(node: exp.Expression | None) -> bool:
+    """A value: literals, dates built from literals or today, intervals, arithmetic of those."""
+    return node is not None and not node.find(exp.Column, exp.AggFunc, exp.Window, exp.Subquery, exp.Select)
 
 
 def _conjuncts(cond: exp.Expression | None) -> list[exp.Expression]:

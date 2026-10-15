@@ -254,24 +254,34 @@ user's scope, and retrieval must map benchmark questions to the right trio.
    filter, join, group, order) must fit an **allowlisted shape**, because no list of forbidden
    tricks survives arbitrary SQL (three red-team rounds found windows that copy one customer's
    value onto every row, rounding functions that build a one-row picker, row multiplication,
-   UNION padding, correlated subqueries...):
+   UNION padding, correlated subqueries...; a fourth round, against the allowlist, found three gaps
+   in it, now closed: a renamed column passing as a product key, an ID in a customer-set HAVING,
+   and OR-padding a MIN):
    - One aggregation: `SELECT dimensions, aggregates FROM ... WHERE ... GROUP BY dimensions`, plus
      `HAVING`, `ORDER BY`, `LIMIT` and `UNION ALL` of such SELECTs.
-   - **Dimensions** (GROUP BY and filters): any expression of attribute, category, date or amount
-     columns, but never an ID (customer, order, order line). An ID may only join tables, be counted
-     or be tested `IS NULL`, so neither "customer 35's state" nor "the state of whoever placed order
-     1" can be asked for.
+   - **Dimensions** (GROUP BY): any expression of attribute, category, date or amount columns, but
+     never an ID (customer, order, order line), and CASE / IF only over one column (bands). An ID may
+     only join tables, be counted or be tested `IS NULL`, so neither "customer 35's state" nor "the
+     state of whoever placed order 1" can be asked for.
+   - **Filters** (WHERE, join filters, the condition inside an aggregate): comparisons of a column
+     with values (`=`, `<`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`, `NOT IN`), combined with `AND`; `OR`
+     only between values of one column. A filter can narrow a group but never form "this person OR
+     people whose attributes I already know", which would let `MIN`, `AVG` or a difference of two
+     counts reveal the one person.
    - **Joins** on key relationships (`u.id = oi.user_id`, `o.order_id = oi.order_id`,
-     `oi.product_id = p.id`). An inner join may add filters; an outer join may not, because
-     `LEFT JOIN ... ON key AND <selector>` blanks every row but one's.
+     `oi.product_id = p.id`), recognised by the column's real source, not its name. Only customer and
+     order keys make two tables' rows one customer's: a product key joins lines to products, and two
+     customers joined through it are counted separately. An inner join may add filters; an outer join
+     may not, because `LEFT JOIN ... ON key AND <selector>` blanks every row but one's.
    - **Aggregates**: `COUNT(*)`, `COUNT(DISTINCT col)`, `SUM` / `AVG` / `STDDEV` of plain amounts
      (amount columns combined with `+ - *`, scaled by a constant, or day-level date differences;
      no rounding, conditions or constant offsets), at most one condition per aggregate
      (`COUNTIF(c)`, `SUM(IF(c, x, 0))`), and `MIN` / `MAX` / one quantile of attributes only (a
      single price or timestamp can be looked up to find its buyer). Window functions only over the
      finished aggregates (shares, ranks).
-   - **Steps** (CTEs, derived tables): rows (a filter that keeps `user_id`), a set of customers
-     (`SELECT user_id ... GROUP BY user_id HAVING ... [ORDER BY ... LIMIT n]`), or an aggregation
+   - **Steps** (CTEs, derived tables): rows (a filter that keeps `user_id`; one customer per row), a
+     set of customers (`SELECT user_id ... GROUP BY user_id HAVING ... [ORDER BY ... LIMIT n]`, where
+     HAVING compares plain per-customer aggregates with values, no IDs, no OR), or an aggregation
      that follows these rules. Per-customer figures cannot be carried forward; they are ratios in the
      final SELECT (`SUM(sale_price) / COUNT(DISTINCT user_id)`).
    - Never: subqueries in expressions, `UNNEST`, `PIVOT`, recursion, `ARRAY_AGG` / `STRING_AGG` /

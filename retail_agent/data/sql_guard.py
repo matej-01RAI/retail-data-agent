@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
 
 from ..identity import ProductScope
 from ..knowledge import DataDictionary
@@ -128,12 +128,20 @@ class SqlGuard:
             statements = [s for s in sqlglot.parse(sql, read="bigquery") if s is not None]
         except ParseError as e:
             raise SqlRejected("invalid_sql", f"SQL syntax error: {_describe_parse_error(e)}") from e
+        except TokenError as e:  # an unterminated string, quoted name or comment
+            raise SqlRejected("invalid_sql", f"SQL syntax error: {_short(str(e))}") from e
         if len(statements) != 1:
             raise SqlRejected("not_read_only", "Send exactly one SELECT statement (no ';'-separated scripts).")
         tree = statements[0]
-        # (SELECT ...) on its own: the parentheses add nothing.
-        while isinstance(tree, exp.Subquery) and {k for k, v in tree.args.items() if v} == {"this"}:
-            tree = tree.this.pop()
+        # (SELECT ...) on its own, or followed by ORDER BY / LIMIT: the parentheses add nothing.
+        while isinstance(tree, exp.Subquery) and not tree.alias:
+            extra = {k: v for k, v in tree.args.items() if v and k != "this"}
+            inner = tree.this
+            if not set(extra) <= {"order", "limit", "offset"} or any(inner.args.get(k) for k in extra):
+                break
+            for k, v in extra.items():
+                inner.set(k, v)
+            tree = inner.pop()
         if not isinstance(tree, exp.Query):
             raise SqlRejected(
                 "not_read_only",

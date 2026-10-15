@@ -123,8 +123,9 @@ dates and aggregates FROM tables joined on their keys (u.id = oi.user_id, o.orde
 oi.order_id, oi.product_id = p.id) WHERE ... GROUP BY .... Aggregates: COUNT(*), \
 COUNT(DISTINCT user_id), SUM / AVG of amounts (prices, costs, quantities, day-level date \
 differences), at most one IF / COUNTIF condition per aggregate, MIN / MAX only of the attributes. \
-Per-customer figures are ratios: SUM(sale_price) / COUNT(DISTINCT user_id). No IDs in filters or \
-GROUP BY, no window functions except over the final aggregates, no subqueries or UNNEST; a CTE may \
+Per-customer figures are ratios: SUM(sale_price) / COUNT(DISTINCT user_id). Filters and \
+conditions are comparisons of a column with values joined by AND (OR only between values of one \
+column, e.g. IN); no IDs in filters or GROUP BY, no window functions except over the final aggregates, no subqueries or UNNEST; a CTE may \
 only filter rows (keeping user_id), pick a set of customers (SELECT user_id ... GROUP BY user_id \
 HAVING ...), or aggregate. Groups with fewer than 5 customers are left out and figures fewer than \
 5 customers contribute to are blank (NULL): say so when something is missing.
