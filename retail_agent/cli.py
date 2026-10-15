@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 from typing import Any
 
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
@@ -69,15 +71,32 @@ class RichUI:
             if len(request.items) > 25:
                 body += f"\n  … and {len(request.items) - 25} more"
             body += f"\n\n[dim]{escape(request.warning)}[/dim]\n"
-            body += f'Type [bold]{request.confirm_phrase}[/bold] to confirm. Anything else cancels.'
+            body += f'Type [bold]{request.confirm_phrase}[/bold] to confirm. Anything else (or Ctrl-C) cancels.'
             console.print(Panel(body, title=f"[bold yellow]⚠ {escape(request.title)}[/bold yellow]", border_style="yellow"))
-            answer = await asyncio.to_thread(console.input, "[yellow]confirm › [/yellow]")
-            ok = answer.strip().lower() == request.confirm_phrase.lower()
+            answer = _read_line("[yellow]confirm › [/yellow]")
+            ok = answer is not None and answer.strip().lower() == request.confirm_phrase.lower()
             console.print("[green]  Confirmed.[/green]" if ok else "[dim]  Cancelled. Nothing was deleted.[/dim]")
             return ok
         finally:
             if self.status:
                 self.status.start()
+
+
+def _read_line(prompt: str) -> str | None:
+    """Read a line in the main thread, so Ctrl-C interrupts it at once (None) and leaves no reader
+    thread behind holding stdin. Nothing else runs on the event loop while the user types."""
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGINT) if main else None
+    if main:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return console.input(prompt)
+    except (KeyboardInterrupt, EOFError):
+        console.print()
+        return None
+    finally:
+        if main:
+            signal.signal(signal.SIGINT, previous)
 
 
 # --------------------------------------------------------------------------- setup
@@ -120,11 +139,14 @@ def _fail_setup(error: Exception) -> None:
 # --------------------------------------------------------------------------- chat
 
 
-async def _answer(assistant, ui: RichUI, question: str) -> None:
+async def _answer(assistant, question: str) -> None:
+    ui = assistant.ui  # after /user the assistant has a new UI
     with console.status("[cyan]Thinking…[/cyan]", spinner="dots") as status:
         ui.status = status
-        result = await assistant.ask(question)
-        ui.status = None
+        try:
+            result = await assistant.ask(question)
+        finally:
+            ui.status = None
     style = "red" if result.outcome not in ("answered", "blocked") else "cyan"
     console.print(Panel(Markdown(result.text), title="[bold]Analyst[/bold]", border_style=style, title_align="left"))
     bits = [f"turn {result.turn_id}", f"{result.latency_ms / 1000:.1f}s"]
@@ -137,34 +159,36 @@ async def _answer(assistant, ui: RichUI, question: str) -> None:
     console.print(f"[dim]{' · '.join(bits)} · /trace for details[/dim]\n")
 
 
-async def chat(args: argparse.Namespace) -> None:
+def chat(args: argparse.Namespace) -> None:
+    """The prompt is read outside the event loop (Ctrl-C there quits at once); each turn runs on one
+    long-lived loop, where Ctrl-C cancels just that turn."""
     settings = _settings(args)
     try:
-        assistant, ui = _build(settings, args.user)
+        assistant, _ = _build(settings, args.user)
     except Exception as e:  # noqa: BLE001
         _fail_setup(e)
         return
     _banner(assistant)
     last_turn: str | None = None
-    while True:
-        try:
-            text = (await asyncio.to_thread(console.input, "[bold green]you › [/bold green]")).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            break
-        if not text:
-            continue
-        if text.startswith("/"):
-            keep_going, assistant = await _command(text, assistant, ui, settings, last_turn)
-            if not keep_going:
+    with asyncio.Runner() as runner:
+        while True:
+            line = _read_line("[bold green]you › [/bold green]")
+            if line is None:
                 break
-            continue
-        try:
-            await _answer(assistant, ui, text)
-        except KeyboardInterrupt:
-            console.print("[dim]Interrupted.[/dim]")
-        recent = assistant.services.telemetry.recent_turns(1, assistant.session_id)
-        last_turn = recent[0]["turn_id"] if recent else last_turn
+            text = line.strip()
+            if not text:
+                continue
+            if text.startswith("/"):
+                keep_going, assistant = _command(text, assistant, settings, last_turn)
+                if not keep_going:
+                    break
+                continue
+            try:
+                runner.run(_answer(assistant, text))
+            except KeyboardInterrupt:  # a second Ctrl-C before the turn wound down
+                console.print("[dim]Interrupted.[/dim]")
+            recent = assistant.services.telemetry.recent_turns(1, assistant.session_id)
+            last_turn = recent[0]["turn_id"] if recent else last_turn
     assistant.services.telemetry.flush()
 
 
@@ -182,7 +206,7 @@ def _banner(assistant) -> None:
     ))
 
 
-async def _command(text: str, assistant, ui: RichUI, settings: Settings, last_turn: str | None):
+def _command(text: str, assistant, settings: Settings, last_turn: str | None):
     parts = text.split()
     cmd, rest = parts[0].lower(), parts[1:]
     s = assistant.services
@@ -202,7 +226,7 @@ async def _command(text: str, assistant, ui: RichUI, settings: Settings, last_tu
         else:
             try:
                 s.telemetry.flush()
-                assistant, ui = _build(settings, rest[0])
+                assistant, _ = _build(settings, rest[0])
                 _banner(assistant)
             except Exception as e:  # noqa: BLE001
                 console.print(f"[red]{escape(str(e))}[/red]")
@@ -230,13 +254,13 @@ async def _command(text: str, assistant, ui: RichUI, settings: Settings, last_tu
             console.print("[dim]Preferences cleared.[/dim]")
         else:
             prefs = s.prefs.get(user.id)
-            console.print(json.dumps(prefs, indent=2) if prefs else "[dim]No preferences remembered yet.[/dim]")
+            console.print(escape(json.dumps(prefs, indent=2)) if prefs else "[dim]No preferences remembered yet.[/dim]")
     elif cmd == "/trace":
         turn_id = rest[0] if rest else last_turn
         if not turn_id:
             console.print("[dim]No turn yet.[/dim]")
         else:
-            show_trace(s.telemetry, turn_id)
+            show_trace(s.telemetry, turn_id, user_id=user.id)
     elif cmd == "/stats":
         show_stats(s.telemetry)
     elif cmd == "/chaos":
@@ -251,12 +275,19 @@ def _chaos(rest: list[str], assistant) -> None:
     primary = assistant.primary_model
     if not rest or rest[0] == "off":
         wh.faults.remaining = 0
+        wh.breaker.record_success()  # close a circuit the simulated outage opened
         if primary:
             primary.fail_next = 0
-        console.print("[dim]Fault injection off.[/dim]")
+        console.print("[dim]Fault injection off; warehouse circuit closed.[/dim]")
         return
-    target, n = rest[0], int(rest[1]) if len(rest) > 1 else 1
-    if target == "bq":
+    try:
+        n = int(rest[1]) if len(rest) > 1 else 1
+    except ValueError:
+        n = -1
+    target = rest[0]
+    if not 0 < n <= 100:
+        console.print("Usage: /chaos bq <n> | llm <n> | off   (n from 1 to 100)")
+    elif target == "bq":
         wh.faults.remaining = n
         console.print(f"[yellow]The next {n} warehouse call(s) will fail with a simulated 503.[/yellow]")
     elif target == "llm" and primary:
@@ -269,10 +300,10 @@ def _chaos(rest: list[str], assistant) -> None:
 # --------------------------------------------------------------------------- trace & stats
 
 
-def show_trace(telemetry, turn_id: str) -> None:
+def show_trace(telemetry, turn_id: str, user_id: str | None = None) -> None:
     from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-    detail = telemetry.turn_detail(turn_id)
+    detail = telemetry.turn_detail(turn_id, user_id=user_id)
     if not detail:
         console.print(f"[red]No turn {escape(turn_id)}.[/red]")
         return
@@ -343,12 +374,12 @@ def _short(text: str, limit: int = 200) -> str:
 async def ask(args: argparse.Namespace) -> None:
     settings = _settings(args)
     try:
-        assistant, ui = _build(settings, args.user)
+        assistant, _ = _build(settings, args.user)
     except Exception as e:  # noqa: BLE001
         _fail_setup(e)
         return
     console.print(f"[bold green]{escape(assistant.user.name)} ›[/bold green] {escape(args.question)}")
-    await _answer(assistant, ui, args.question)
+    await _answer(assistant, args.question)
     assistant.services.telemetry.flush()
 
 
@@ -379,7 +410,8 @@ def doctor(args: argparse.Namespace) -> None:
             line(False, "Gemini reachable", f"{type(e).__name__}: {str(e)[:200]}")
     try:
         warehouse = build_warehouse(settings)
-        line(True, f"Warehouse client ({settings.warehouse})", settings.gcp_project or "default project")
+        source = getattr(warehouse, "credentials_source", "local file")
+        line(True, f"Warehouse client ({settings.warehouse})", f"{settings.gcp_project or 'default project'}; {source}")
         dictionary = DataDictionary.load(settings.knowledge_dir / "data_dictionary.yaml")
         live = warehouse.live_columns()
         line(live is not None, "Read table schemas", ", ".join(sorted(live)) if live else "failed")
@@ -435,13 +467,6 @@ def sample_db(args: argparse.Namespace) -> None:
     console.print(f"Built {settings.duckdb_path}: {counts}")
 
 
-def _run_interactive(coro) -> None:
-    try:
-        asyncio.run(coro)
-    except KeyboardInterrupt:
-        console.print("\n[dim]Bye.[/dim]")
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m retail_agent", description="Retail data analysis chat agent")
     sub = parser.add_subparsers(dest="command")
@@ -470,7 +495,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING"), format="%(levelname)s %(name)s: %(message)s")
     commands = {
-        "chat": lambda: _run_interactive(chat(args)),
+        "chat": lambda: chat(args),
         "ask": lambda: asyncio.run(ask(args)),
         "doctor": lambda: doctor(args),
         "stats": lambda: stats_cmd(args),

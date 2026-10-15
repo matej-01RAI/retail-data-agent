@@ -304,6 +304,8 @@ def build_agent(services: Services, model: Model | str) -> Agent[Deps, AgentOutp
             raise ToolFailed("Deletion was not confirmed by the user. Nothing was deleted.")
         deleted = deps.services.reports.soft_delete(deps.user.id, deps.session_id, report_ids, batch=deps.turn_id)
         titles = ", ".join(f"{r.id} ({r.title})" for r in deleted) or "none"
+        if deleted:
+            deps.stats.side_effects.append(f"deleted {len(deleted)} report(s): {titles}. /undo restores them.")
         return f"Deleted {len(deleted)} report(s): {titles}. The user can restore them with /undo."
 
     # ------------------------------------------------------------------ memory
@@ -400,7 +402,7 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
             )
 
         stats.sql_succeeded()
-        stats.bytes_processed += result.bytes_processed
+        stats.bytes_processed += 0 if result.cache_hit else result.bytes_processed
         rows, redacted = _scrub_rows(result.rows)
         stats.pii_redactions += redacted
         span.set_attributes({

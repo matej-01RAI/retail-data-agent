@@ -20,7 +20,13 @@ def build_warehouse(settings: Settings) -> Warehouse:
     if settings.warehouse == "duckdb":
         return DuckDBWarehouse(settings.duckdb_path, settings.dataset)
     if settings.warehouse == "bigquery":
-        return BigQueryWarehouse(settings.gcp_project, settings.dataset, settings.max_bytes_billed, settings.query_timeout_s)
+        return BigQueryWarehouse(
+            settings.gcp_project,
+            settings.dataset,
+            settings.max_bytes_billed,
+            settings.query_timeout_s,
+            service_account_json=settings.gcp_service_account_json,
+        )
     raise ValueError(f"WAREHOUSE must be 'bigquery' or 'duckdb', not {settings.warehouse!r}")
 
 

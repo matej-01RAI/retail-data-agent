@@ -9,6 +9,7 @@ Changes from the original (all backwards compatible):
   this avoids requiring the BigQuery Storage API permission.
 - The docstring no longer claims a default dataset is applied to queries: it
   is not, so SQL must use fully-qualified table names (the SQL guard ensures it).
+- Optional `credentials`, for a service-account key held in memory.
 Error handling and retries live in warehouse.py, which knows which errors the
 model can fix and which are outages.
 """
@@ -25,7 +26,12 @@ logger = logging.getLogger(__name__)
 class BigQueryRunner:
     """A lean BigQuery client for executing SQL queries and returning DataFrame results."""
 
-    def __init__(self, project_id: Optional[str] = None, dataset_id: Optional[str] = "bigquery-public-data.thelook_ecommerce") -> None:
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        dataset_id: Optional[str] = "bigquery-public-data.thelook_ecommerce",
+        credentials: Optional[Any] = None,
+    ) -> None:
         """Initialize BigQuery client.
 
         Args:
@@ -33,10 +39,11 @@ class BigQueryRunner:
                 project of the application default credentials is used.
             dataset_id: Dataset whose table schemas `get_table_schema` reads.
                 Queries must still use fully-qualified table names.
+            credentials: google.auth credentials; None uses application default credentials.
         """
         logger.info("Initializing BigQuery client")
         try:
-            self.client = bigquery.Client(project=project_id)
+            self.client = bigquery.Client(project=project_id, credentials=credentials)
             self.dataset_id = dataset_id
             logger.info(f"BigQuery client initialized for dataset: {self.dataset_id}")
         except Exception as e:

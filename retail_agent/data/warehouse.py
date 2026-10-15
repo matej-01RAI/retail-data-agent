@@ -16,6 +16,7 @@ fault injection for demos and tests.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
@@ -95,17 +96,52 @@ def _frame_to_rows(df: pd.DataFrame, max_rows: int) -> tuple[list[str], list[lis
 
 # --------------------------------------------------------------------------- BigQuery
 
+BIGQUERY_SCOPES = ("https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/cloud-platform")
+
+
+def service_account_credentials(raw: str):
+    """Credentials from a service-account key held in memory (GCP_SA_KEY_JSON); nothing touches disk.
+
+    A key that is set but unusable is an error, not a silent fall back to another login. The
+    message never includes the key's content."""
+    from google.oauth2 import service_account
+
+    try:
+        info = json.loads(raw)
+    except ValueError:
+        raise ValueError("GCP_SA_KEY_JSON is set but is not valid JSON. Paste the whole key file, or unset it.") from None
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise ValueError("GCP_SA_KEY_JSON is set but is not a service-account key (\"type\": \"service_account\").")
+    try:
+        return service_account.Credentials.from_service_account_info(info, scopes=BIGQUERY_SCOPES)
+    except (ValueError, KeyError) as e:
+        missing = str(e) if "missing fields" in str(e) else type(e).__name__
+        raise ValueError(f"GCP_SA_KEY_JSON is set but the key is not usable ({missing}).") from None
+
 
 class BigQueryWarehouse:
     name = "bigquery"
 
-    def __init__(self, project: str | None, dataset: str, max_bytes_billed: int, timeout_s: float):
+    def __init__(
+        self,
+        project: str | None,
+        dataset: str,
+        max_bytes_billed: int,
+        timeout_s: float,
+        service_account_json: str | None = None,
+    ):
         from google.cloud import bigquery  # imported lazily: offline mode does not need credentials
 
         from .bigquery_runner import BigQueryRunner
 
         self._bq = bigquery
-        self.runner = BigQueryRunner(project_id=project, dataset_id=dataset)
+        credentials = None
+        self.credentials_source = "application default credentials"
+        if service_account_json:
+            credentials = service_account_credentials(service_account_json)
+            project = project or credentials.project_id
+            self.credentials_source = f"service-account key from GCP_SA_KEY_JSON ({credentials.service_account_email})"
+        self.runner = BigQueryRunner(project_id=project, dataset_id=dataset, credentials=credentials)
         self.dataset = dataset
         self.max_bytes_billed = max_bytes_billed
         self.timeout_s = timeout_s
