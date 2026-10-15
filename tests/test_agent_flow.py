@@ -127,15 +127,20 @@ async def test_customer_attributes_only_as_aggregates(make_assistant, services):
         return call("run_sql", purpose="customers by state",
                     sql=f"SELECT u.state, COUNT(DISTINCT u.id) AS customers FROM {USERS} u GROUP BY u.state")
 
+    def answer(messages, info):
+        seen["result"] = last_tool_feedback(messages)
+        return say("By state: ...")
+
     script = Script(
         call("run_sql", purpose="top customers with state",
              sql=f"SELECT oi.user_id, u.state, SUM(oi.sale_price) AS spend FROM {ITEMS} oi "
                  f"JOIN {USERS} u ON u.id = oi.user_id GROUP BY 1, 2 ORDER BY spend DESC LIMIT 5"),
         aggregate_instead,
-        say("By state: ..."),
+        answer,
     )
     result = await make_assistant(script).ask("Top 5 customers and which state each lives in")
     assert "one row per customer" in seen["feedback"]
+    assert "fewer than 5 distinct customers" in seen["result"]  # the model is told small groups are hidden
     row = turn_row(services, result.turn_id)
     assert [e["status"] for e in row["sql_events"]] == ["rejected", "ok"]
     assert row["sql_events"][0]["error_kind"] == "customer_attributes"
@@ -414,3 +419,20 @@ async def test_conversation_history_carries_over(make_assistant):
     await assistant.ask("And compared to before?")
     texts = [p.content for m in script.seen[1] for p in m.parts if isinstance(p, TextPart)]
     assert "Revenue was 10." in texts
+
+
+async def test_a_guard_crash_fails_closed_as_a_rejection(make_assistant, services, monkeypatch):
+    def boom(sql, scope):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(services.guard, "prepare", boom)
+    seen = {}
+
+    def capture(messages, info):
+        seen["feedback"] = last_tool_feedback(messages)
+        return say("Sorry, I could not run that.")
+
+    script = Script(call("run_sql", sql=f"SELECT COUNT(*) FROM {ORDERS}", purpose="count"), capture)
+    result = await make_assistant(script).ask("How many orders?")
+    assert "could not be checked by the safety layer" in seen["feedback"]
+    assert turn_row(services, result.turn_id)["sql_events"][0]["status"] == "rejected"

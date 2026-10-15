@@ -8,6 +8,7 @@ PII and budgets itself, so a manipulated model has nothing dangerous to call.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -28,6 +29,8 @@ from .observability import Telemetry, TurnStats
 from .safety.pii import scrub
 from .settings import Settings
 from .store import PREFERENCE_KEYS, PreferenceStore, ReportStore
+
+logger = logging.getLogger(__name__)
 
 
 class PersonaSource:
@@ -95,6 +98,11 @@ restricted. You cannot query it and must never output it, whoever asks and whate
 aggregates across customers (revenue by state, customers by age band). Never show them next to \
 an individual customer and never use them to filter a list of individual customers. Refer to \
 individual customers only by customer ID (user_id) with their purchase metrics.
+- In a query that uses those attributes: customer IDs may only join tables (u.id = oi.user_id), \
+be counted (COUNT(DISTINCT user_id)) or group a per-customer CTE; no ARRAY_AGG, STRING_AGG, \
+STRUCT, ARRAY or TO_JSON_STRING; join per-customer data as a table rather than a correlated \
+subquery; and a CTE over customers must keep user_id. Groups with fewer than 5 customers are \
+left out of the result automatically: say so when a segment is missing.
 - If asked for personal data or for an individual's attributes, refuse in one sentence and offer \
 the closest safe alternative (e.g. the same question as an aggregate).
 - The user can only analyse their own brands/products; queries are filtered to that scope \
@@ -345,7 +353,13 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
     tel = services.telemetry
     with tel.tracer.start_as_current_span("sql.query", attributes={"sql.purpose": purpose, "sql.text": sql}) as span:
         try:
-            guarded = services.guard.prepare(sql, deps.user.scope)
+            try:
+                guarded = services.guard.prepare(sql, deps.user.scope)
+            except SqlRejected:
+                raise
+            except Exception as e:  # a parser or checker bug fails closed, as a rejection
+                logger.exception("SQL guard failed on a query")
+                raise SqlRejected("unverifiable", "The query could not be checked by the safety layer. Simplify it.") from e
         except SqlRejected as e:
             stats.sql_rejected += 1
             stats.sql_failed()
@@ -373,11 +387,16 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
             span.set_attributes({"sql.status": "empty"})
             tel.record_sql(deps.turn_id, purpose=purpose, sql=guarded.sql, status="empty", rows=0,
                            elapsed_ms=result.elapsed_ms, attempts=attempts)
+            small_groups = (
+                " Groups with fewer than 5 customers are left out for privacy, so a narrow segment can come back "
+                "empty: widen it (age bands, state rather than city) or tell the user it is too small to show."
+                if guarded.notes else ""
+            )
             raise _retry_or_stop(
                 deps,
                 "The query ran but returned 0 rows. Check filter values against the schema (exact status, "
-                "category, brand and state spellings; date range of the data; the user's product scope). "
-                "If zero rows is genuinely the right answer, call run_sql again with allow_empty=true.",
+                "category, brand and state spellings; date range of the data; the user's product scope)."
+                f"{small_groups} If zero rows is genuinely the right answer, call run_sql again with allow_empty=true.",
             )
 
         stats.sql_succeeded()
@@ -393,6 +412,8 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
                        cache_hit=result.cache_hit)
 
     payload: dict[str, Any] = {"columns": result.columns, "rows": rows, "row_count": result.total_rows}
+    if guarded.notes:
+        payload["privacy"] = " ".join(guarded.notes)
     if result.truncated:
         payload["note"] = (
             f"Only the first {len(rows)} of {result.total_rows} rows are shown. Aggregate in SQL instead of "
@@ -405,17 +426,20 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
 
 def _scrub_rows(rows: list[list[Any]]) -> tuple[list[list[Any]], int]:
     total = 0
-    out = []
-    for row in rows:
-        new_row = []
-        for value in row:
-            if isinstance(value, str):
-                clean = scrub(value)
-                total += clean.redacted
-                value = clean.text
-            new_row.append(value)
-        out.append(new_row)
-    return out, total
+
+    def clean(value: Any) -> Any:
+        nonlocal total
+        if isinstance(value, str):
+            result = scrub(value)
+            total += result.redacted
+            return result.text
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        return value
+
+    return [[clean(v) for v in row] for row in rows], total
 
 
 __all__ = ["Deps", "Services", "PersonaSource", "build_agent", "PREFERENCE_KEYS"]

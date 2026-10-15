@@ -6,10 +6,11 @@ reach BigQuery. It does not trust the model, the prompt or the user:
 1. Parse (BigQuery dialect). Exactly one statement, and it must be a query
    (SELECT / WITH / set operation). DML, DDL, scripting, EXPORT DATA -> rejected.
 2. Allowlist. Every table must be one of the dataset's analysis tables (or a
-   CTE defined in the query). INFORMATION_SCHEMA, other datasets, wildcard
-   tables and table-valued functions -> rejected. A small denylist of
-   functions that reach outside the dataset (EXTERNAL_QUERY, ML.*, AI.*, ...)
-   -> rejected.
+   CTE defined in the query; a CTE may not reuse a table's name).
+   INFORMATION_SCHEMA, other datasets, wildcard tables and table-valued
+   functions -> rejected. Functions that reach outside the dataset
+   (EXTERNAL_QUERY, ML.*, AI.*, ...) and user-defined or qualified functions
+   (`project.dataset.fn`) -> rejected.
 3. PII. Any reference to a PII column (by name, anywhere in the query) is
    rejected with a message that tells the model what to use instead.
 4. Rewrite. Every table reference is replaced by a *scoped subquery* that
@@ -20,7 +21,8 @@ reach BigQuery. It does not trust the model, the prompt or the user:
    products, and an order's num_of_item counts only its in-scope items.
 5. Customer attributes only in aggregates (aggregate_rule.py): city, state,
    country, age, gender and traffic source never sit next to an individual
-   customer, never filter a list of customers, and are only shown aggregated.
+   customer, never filter a list of customers, and are only shown aggregated,
+   over groups of at least 5 customers (a HAVING clause the guard adds).
 
 The rewritten SQL is what runs. In production the same guarantees are also
 enforced by BigQuery itself (authorized views + row-level access policies +
@@ -37,7 +39,7 @@ from sqlglot.errors import ParseError
 
 from ..identity import ProductScope
 from ..knowledge import DataDictionary
-from .aggregate_rule import AggregateOnlyRule
+from .aggregate_rule import AggregateOnlyRule, Rejected
 
 DENIED_FUNCTION_PREFIXES = (
     "EXTERNAL_QUERY",
@@ -69,6 +71,7 @@ class GuardedQuery:
     original_sql: str
     sql: str  # rewritten, scoped SQL (BigQuery dialect)
     tables: tuple[str, ...]  # analysis tables referenced
+    notes: tuple[str, ...] = ()  # for the model, e.g. that small groups were left out
 
 
 class SqlGuard:
@@ -88,22 +91,24 @@ class SqlGuard:
                 live = {c.lower() for c in live_columns[name]}
                 cols = [c for c in cols if c.lower() in live]
             self.projection[name] = cols
-        self.aggregate_rule = AggregateOnlyRule(dictionary, project, dataset)
+        self.aggregate_rule = AggregateOnlyRule(dictionary, project, dataset, self.projection)
 
     # ------------------------------------------------------------------ public
 
     def prepare(self, sql: str, scope: ProductScope) -> GuardedQuery:
         tree = self._parse_single_query(sql)
-        cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+        cte_names = self._check_ctes(tree)
         self._check_functions(tree)
         self._check_pii(tree)
         tables = self._check_and_collect_tables(tree, cte_names)
-        rewritten = self._rewrite(tree, tables, cte_names, scope).sql(dialect="bigquery")
-        problems = self.aggregate_rule.violations(rewritten)
-        if problems:
-            raise SqlRejected(problems[0][0], " ".join(message for _, message in problems))
+        try:
+            checked = self.aggregate_rule.check(tree)
+        except Rejected as e:
+            raise SqlRejected(e.kind, e.message) from e
+        out = checked.tree if checked.tree is not None else tree
+        rewritten = self._rewrite(out, scope).sql(dialect="bigquery")
         names = tuple(sorted({self._table_key(t) for t in tables}))
-        return GuardedQuery(original_sql=sql, sql=rewritten, tables=names)
+        return GuardedQuery(original_sql=sql, sql=rewritten, tables=names, notes=checked.notes)
 
     def fq_name(self, table: str) -> str:
         return f"`{self.project}.{self.dataset_name}.{table}`"
@@ -130,7 +135,25 @@ class SqlGuard:
             raise SqlRejected("not_read_only", f"{node.key.upper()} is not allowed inside a query.")
         return tree
 
+    def _check_ctes(self, tree: exp.Expression) -> set[str]:
+        names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+        shadowing = sorted(names & self.allowed_tables)
+        if shadowing:
+            raise SqlRejected(
+                "forbidden_table",
+                f"A CTE may not reuse a table's name ({', '.join(shadowing)}). Name it something else, e.g. "
+                f"{shadowing[0]}_filtered.",
+            )
+        return names
+
     def _check_functions(self, tree: exp.Expression) -> None:
+        for func in tree.find_all(exp.Anonymous):
+            if "." in func.name or (isinstance(func.parent, exp.Dot) and func.parent.expression is func):
+                raise SqlRejected(
+                    "forbidden_function",
+                    f"User-defined or qualified functions ({func.sql('bigquery').split('(')[0]}) are not available; "
+                    "use BigQuery built-in functions.",
+                )
         for func in tree.find_all(exp.Func):
             name = (func.sql_name() if not isinstance(func, exp.Anonymous) else func.name).upper()
             parent = func.parent
@@ -167,7 +190,7 @@ class SqlGuard:
             db = (table.db or "").lower()
             catalog = (table.catalog or "").lower()
             if not db and not catalog and name in cte_names:
-                continue  # reference to a CTE defined in this query
+                continue  # reference to a CTE defined in this query (never a table name: see _check_ctes)
             if "*" in name or name.endswith("information_schema") or db.endswith("information_schema"):
                 raise SqlRejected("forbidden_table", "Metadata and wildcard tables are not available. Use describe_data.")
             if name not in self.allowed_tables:
@@ -185,11 +208,12 @@ class SqlGuard:
 
     # ------------------------------------------------------------------ rewrite
 
-    def _rewrite(
-        self, tree: exp.Expression, tables: list[exp.Table], cte_names: set[str], scope: ProductScope
-    ) -> exp.Expression:
-        for table in tables:
+    def _rewrite(self, tree: exp.Expression, scope: ProductScope) -> exp.Expression:
+        # Every reference to an analysis table: CTEs cannot take a table's name (_check_ctes).
+        for table in list(tree.find_all(exp.Table)):
             name = self._table_key(table)
+            if name not in self.allowed_tables:
+                continue
             alias = table.alias or table.name
             scoped = self._scoped_select(name, scope)
             table.replace(exp.Subquery(this=scoped, alias=exp.TableAlias(this=exp.to_identifier(alias))))

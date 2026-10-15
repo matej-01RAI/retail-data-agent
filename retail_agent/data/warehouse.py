@@ -69,9 +69,14 @@ class Warehouse(Protocol):
 
 
 def _plain(value: Any) -> Any:
-    """Make a DataFrame cell JSON-friendly (and compact) for the model."""
-    if isinstance(value, (list, dict, tuple)):
-        return value
+    """Make a DataFrame cell JSON-friendly (and compact) for the model. ARRAY and STRUCT cells
+    arrive as numpy arrays, lists and dicts; their elements are converted too."""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if getattr(value, "ndim", 0):  # numpy array
+        return [_plain(v) for v in value.tolist()]
     if value is None or pd.isna(value):
         return None
     if hasattr(value, "isoformat"):

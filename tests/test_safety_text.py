@@ -70,3 +70,18 @@ def test_normal_questions_pass(text):
 def test_long_and_empty_inputs():
     assert screen("x" * (MAX_INPUT_CHARS + 1)).reason == "too_long"
     assert screen("   ").reason == "empty"
+
+
+def test_array_and_struct_cells_are_converted_and_scrubbed():
+    import numpy as np
+
+    from retail_agent.agent import _scrub_rows
+    from retail_agent.data.warehouse import _plain
+
+    cell = _plain(np.array([{"note": "mail jane.doe@example.com", "n": np.int64(3)}, {"note": "ok", "n": None}], dtype=object))
+    assert cell == [{"note": "mail jane.doe@example.com", "n": 3}, {"note": "ok", "n": None}]
+    assert _plain(np.array([1.234567, 2.0])) == [1.2346, 2.0]
+    rows, redacted = _scrub_rows([[cell, ["call +1 415-555-0132"], "plain"]])
+    assert redacted == 2
+    assert rows[0][0][0]["note"] == "mail [REDACTED EMAIL]"
+    assert rows[0][1] == ["call [REDACTED PHONE]"]
