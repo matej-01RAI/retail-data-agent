@@ -92,6 +92,8 @@ class Settings:
     # A service-account key (JSON) for environments without a gcloud login. Used in memory only,
     # never written to disk, and kept out of repr() so it cannot leak into logs.
     gcp_service_account_json: str | None = field(default=None, repr=False)
+    # HTTP API bearer tokens, "user_id:token,..." (retail_agent/api.py). Never logged.
+    api_tokens: str | None = field(default=None, repr=False)
 
     @property
     def db_path(self) -> Path:
@@ -141,4 +143,5 @@ def load_settings(env_file: str | None = None) -> Settings:
         history_turns=_int("HISTORY_TURNS", 8),
         data_dir=data_dir,
         gcp_service_account_json=os.getenv("GCP_SA_KEY_JSON") or None,
+        api_tokens=os.getenv("API_TOKENS") or None,
     )

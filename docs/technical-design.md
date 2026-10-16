@@ -561,7 +561,7 @@ background, compared offline), then a canary rollout with SLO monitoring.
 
 ### 8.3 Prototype
 
-About 320 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
+About 340 offline tests (`pytest`, also run by GitHub Actions on every push): SQL-guard red team,
 text safety, golden-trio validation for every scope, BigQuery dry-run and error classification
 against a fake runner, settings and CLI commands, and 32 end-to-end agent flows with a scripted
 model (self-correction, give-up bounds, empty results, PII, scope, injection, deletion flows,
@@ -698,7 +698,7 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 
 | Concern | Prototype | Production |
 |---|---|---|
-| Interface | Rich CLI | Web app (SSE) + Slack/Teams adapters over the Chat API |
+| Interface | Rich CLI, and a FastAPI HTTP API (bearer tokens, approvals over two requests, sessions in memory) | Web app (SSE) + Slack/Teams adapters over the Chat API; paused runs in Cloud SQL |
 | Identity | `--user` from `config/users.yaml` | IAP / IdP SSO, entitlement service |
 | Data access | Guard rewrite to brand-scoped subqueries, aggregate-only rule with a 5-customer minimum, dry-run checks | Same guard **plus** per-scope SAs, authorized views, row policies, policy tags, aggregation-threshold views |
 | LLM | AI Studio API, `*-latest` aliases, retries, fallback, limiter | Vertex AI, pinned versions, same chain, quotas / provisioned throughput |
@@ -708,4 +708,4 @@ turns, since the work is I/O-bound waiting on Gemini and BigQuery.
 | Observability | OTel -> JSONL, SQLite metrics, `/trace`, `/stats` | OTel -> Cloud Trace, logs -> BigQuery, Cloud Monitoring SLOs and alerts |
 | Persona | File, hot-reloaded | Firestore registry, admin console, preview, rollback |
 | Learning | Explicit preferences | Plus implicit preference proposals and the system-level loop |
-| Evaluation | About 320 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |
+| Evaluation | About 340 offline tests, run in CI | Plus live eval harness, LLM judge, shadow and canary |

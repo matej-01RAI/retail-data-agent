@@ -455,3 +455,21 @@ def test_integer_division_keeps_its_grouping_offline(sample_db):
 
     warehouse = DuckDBWarehouse(sample_db, "bigquery-public-data.thelook_ecommerce")
     assert warehouse.query("SELECT DIV(11 - 1, 5) AS x", labels={}, max_rows=1).rows == [[2]]
+
+
+def test_group_by_prefers_the_select_alias_offline_as_bigquery_does(sample_db, guard):
+    """GROUP BY product_id after `p.id AS product_id`: BigQuery (and the guard's analysis) mean
+    the alias, not oi.product_id. DuckDB alone would pick the column and fail."""
+    from retail_agent.data.warehouse import DuckDBWarehouse
+
+    warehouse = DuckDBWarehouse(sample_db, "bigquery-public-data.thelook_ecommerce")
+    sql = guard.prepare(
+        "SELECT p.id AS product_id, p.name AS product_name, COUNT(oi.id) AS units "
+        "FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi "
+        "JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON oi.product_id = p.id "
+        "GROUP BY product_id, product_name ORDER BY units DESC LIMIT 3", ALL).sql
+    result = warehouse.query(sql, labels={}, max_rows=3)
+    assert result.columns[:2] == ["product_id", "product_name"] and len(result.rows) == 3
+    # A real column still wins when no alias claims the name.
+    assert warehouse.query("SELECT COUNT(*) AS n FROM `bigquery-public-data.thelook_ecommerce.orders` "
+                           "GROUP BY status", labels={}, max_rows=10).total_rows >= 3
