@@ -14,8 +14,8 @@ dangerous to call.
 |---|---|
 | High-level design (architecture diagrams, services, data flow, data stores) | [docs/architecture.md](docs/architecture.md) |
 | Detailed technical explanation, requirement by requirement | [docs/technical-design.md](docs/technical-design.md) |
-| Working prototype (CLI) | [`retail_agent/`](retail_agent) |
-| Tests (about 320, run by GitHub Actions on every push: safety red-team, end-to-end agent flows, golden-trio validation, BigQuery error handling) | [`tests/`](tests) |
+| Working prototype (CLI, plus an HTTP API for a web or chat front end) | [`retail_agent/`](retail_agent) |
+| Tests (about 340, run by GitHub Actions on every push: safety red-team, end-to-end agent flows, golden-trio validation, BigQuery error handling) | [`tests/`](tests) |
 
 ---
 
@@ -51,7 +51,7 @@ python -m retail_agent --user ceo --offline
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                            # about 320 tests, under 10 s
+pytest                            # about 340 tests, under 20 s
 ```
 
 ### Demo users and what they may see
@@ -81,6 +81,59 @@ edit the YAML if thelook's brand names differ.
 
 Other entry points: `python -m retail_agent ask --user tom "question"` (one question, then
 exit), `python -m retail_agent stats`, `python -m retail_agent trace <turn-id>`.
+
+### HTTP API
+
+The same assistant behind FastAPI (`retail_agent/api.py`), for a web or chat front end. Each
+request carries a bearer token that maps to a demo user. With no tokens configured every
+request is refused (503); the API never falls back to a default user.
+
+```bash
+# in .env: API_TOKENS=ceo:<token>,tom:<token>     (16+ characters each: openssl rand -hex 16)
+python -m retail_agent serve --offline            # http://127.0.0.1:8000, OpenAPI docs at /docs
+
+H="Authorization: Bearer $CEO_TOKEN"; J="Content-Type: application/json"; API=http://127.0.0.1:8000
+SID=$(curl -s -X POST -H "$H" $API/v1/sessions | jq -r .session_id)
+curl -s -X POST -H "$H" -H "$J" -d '{"text":"Which 3 categories had the highest net revenue in 2025?"}' \
+  $API/v1/sessions/$SID/messages
+```
+
+```json
+{"session_id": "be65f309790d", "status": "answered",
+ "turn": {"turn_id": "a66da2a93f54", "outcome": "answered", "latency_ms": 25550, "llm_requests": 2, "sql_queries": 1,
+          "text": "The top 3 product categories by net revenue in 2025 were **Outerwear & Coats**, ..."},
+ "progress": ["Querying: Find the top 3 product categories by net revenue in 2025"]}
+```
+
+A turn that would delete reports answers **202** and waits. The response lists the exact
+reports and the phrase to type. Nothing is deleted until the approval endpoint is called with
+that phrase; a wrong phrase gets 422 and changes nothing, `{"confirm": false}` cancels, and an
+approval left unanswered for 10 minutes counts as cancelled.
+
+```bash
+curl -s -X POST -H "$H" -H "$J" -d '{"text":"Delete all the reports we made in this conversation"}' \
+  $API/v1/sessions/$SID/messages
+# 202 {"status": "approval_required", "approval": {"id": "207be4031a63", "title": "Delete 1 saved report?",
+#      "items": ["R-269449  Top 3 Categories by Net Revenue in 2025  (2026-10-16 06:36)"], "confirm_phrase": "delete 1", ...}}
+curl -s -X POST -H "$H" -H "$J" -d '{"confirm": true, "phrase": "delete 1"}' \
+  $API/v1/sessions/$SID/approvals/207be4031a63
+# 200 {"status": "answered", "turn": {"text": "All reports created in this conversation have been deleted.", ...}}
+curl -s -X POST -H "$H" $API/v1/reports/restore     # the CLI's /undo: {"restored": ["R-269449"]}
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/sessions`, `GET` / `DELETE /v1/sessions/{id}` | start, inspect (idle, running, approval required) and end a conversation |
+| `POST /v1/sessions/{id}/messages` | ask: 200 with the answer, 202 with an approval, 409 while a turn is still running |
+| `POST /v1/sessions/{id}/approvals/{approval_id}` | confirm with the phrase, or cancel |
+| `GET /v1/reports`, `GET /v1/reports/{id}`, `POST /v1/reports/restore` | the caller's saved reports |
+| `GET /v1/turns/{turn_id}` | one of the caller's turns: metrics and every SQL attempt (no message content) |
+| `GET /healthz` | liveness |
+
+Another user's conversation or turn answers 404, the same as one that does not exist.
+Conversations live in the server process, as in the CLI. In production the paused run is kept
+in Cloud SQL so any instance can resume it, identity comes from IAP instead of the token table,
+and answers stream over SSE (docs/architecture.md).
 
 ---
 
@@ -182,7 +235,8 @@ with the framework you choose to present.*
   matters, differential privacy. The allowlist also turns away some legitimate attribute
   analyses (window functions over rows, per-customer figures carried in a CTE); the model is
   told the supported form.
-- The CLI has no login: `--user` selects a demo identity. Production uses SSO (see the HLD).
+- The CLI has no login: `--user` selects a demo identity, and the HTTP API maps static tokens
+  to the same identities. Production uses SSO (see the HLD).
 - Name detection in free text is not pattern-based. Names cannot be queried at all, and the
   output scrubber catches emails, phones, addresses, card numbers and IPs. Production adds Cloud
   Sensitive Data Protection for names.
@@ -195,7 +249,8 @@ with the framework you choose to present.*
 
 ```
 retail_agent/
-  cli.py              CLI (chat, ask, doctor, stats, trace, sample-db)
+  cli.py              CLI (chat, ask, doctor, stats, trace, sample-db, serve)
+  api.py              HTTP API (FastAPI): sessions, messages, approvals, reports, turns
   assistant.py        turn loop: input guard -> agent -> approvals -> output scrub -> metrics
   agent.py            Pydantic AI agent: instructions, tools, budgets
   approvals.py        human-in-the-loop policies for destructive tools

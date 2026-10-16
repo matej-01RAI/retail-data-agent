@@ -6,6 +6,7 @@
     python -m retail_agent stats                     agent health metrics
     python -m retail_agent trace <turn-id>           deep dive into one turn
     python -m retail_agent sample-db                 build the offline synthetic dataset
+    python -m retail_agent serve                     HTTP API (FastAPI), see retail_agent/api.py
 
 Add --offline to chat/ask/doctor to use the local synthetic dataset instead of BigQuery.
 """
@@ -459,6 +460,19 @@ def trace_cmd(args: argparse.Namespace) -> None:
     show_trace(Telemetry(Database(settings.db_path), None, settings.traces_path), args.turn_id)
 
 
+def serve(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from .api import create_app
+
+    settings = _settings(args)
+    if not settings.api_tokens:
+        console.print("[yellow]API_TOKENS is not set: every request will be refused (503).[/yellow]")
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        console.print("[yellow]Listening beyond this machine: put TLS in front (in production: Cloud Run + IAP).[/yellow]")
+    uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level=log_level().lower())
+
+
 def sample_db(args: argparse.Namespace) -> None:
     from .data.sample_db import build
 
@@ -486,6 +500,11 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("stats", help="agent health metrics")
     p = sub.add_parser("trace", help="deep dive into one turn")
     p.add_argument("turn_id")
+    p = sub.add_parser("serve", help="HTTP API (FastAPI)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--offline", action="store_true")
+
     p = sub.add_parser("sample-db", help="build the offline synthetic dataset")
     p.add_argument("--users", type=int, default=4000)
 
@@ -504,6 +523,7 @@ def main(argv: list[str] | None = None) -> None:
         "stats": lambda: stats_cmd(args),
         "trace": lambda: trace_cmd(args),
         "sample-db": lambda: sample_db(args),
+        "serve": lambda: serve(args),
     }
     try:
         commands[args.command]()

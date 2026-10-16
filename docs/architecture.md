@@ -32,7 +32,7 @@ reports. The system must:
 | A7 | Golden bucket | JSON trios in GCS, curated by an analyst team that can review agent-proposed candidates. |
 | A8 | Reports | Private to their owner by default (sharing is an extension). Soft delete with a 30-day restore window satisfies "strict confirmation". |
 | A9 | Scale | Tens to low hundreds of executives, peak ~20 concurrent conversations, first token < 3 s, typical answer < 30 s. |
-| A10 | Front end | Web app first (SSE streaming); Slack/Teams are adapters over the same API. The prototype is a CLI. |
+| A10 | Front end | Web app first (SSE streaming); Slack/Teams are adapters over the same API. The prototype is a CLI plus a FastAPI HTTP API (`retail_agent/api.py`). |
 | A11 | Retention | Conversations and logs 90 days, traces 30 days, audit log 2 years, preferences until the user resets them. |
 | A12 | Language | English. |
 

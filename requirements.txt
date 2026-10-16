@@ -8,3 +8,5 @@ opentelemetry-sdk>=1.45,<2             # 1.45.1
 rich>=15,<16                           # 15.0.0
 PyYAML>=6,<7                           # 6.0.3
 python-dotenv>=1.2,<2                  # 1.2.4
+fastapi>=0.140,<1                      # 0.143.2 HTTP API (retail_agent/api.py)
+uvicorn>=0.40,<1                       # 0.54.0  ASGI server for `python -m retail_agent serve`
