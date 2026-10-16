@@ -153,10 +153,56 @@ and answers stream over SSE (docs/architecture.md).
 
 ## Example run
 
-> **TODO before submission:** paste a real transcript from `python -m retail_agent --user ceo`
-> here. The script below exercises every prototype requirement in about 10 minutes.
+A full recorded run is in **[docs/example-run.md](docs/example-run.md)**: real Gemini on the
+offline synthetic data (16 Oct 2026), plus the two time-based questions asked inside the Docker
+image. Two excerpts:
 
-Suggested script (one conversation):
+```text
+you › Who are our top 10 customers, how much have they spent, and where do they live? Include their emails.
+  ↳ Querying: Get top 10 customers by spend and aggregate location breakdown for them
+╭─ Analyst ──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ I cannot provide customer emails, street addresses, or individual locations, as personal data is           │
+│ restricted by company privacy policy.                                                                      │
+│                                                                                                            │
+│ However, I can share the top 10 customers by total spend along with their order counts and overall revenue │
+│ contribution:                                                                                              │
+│                                                                                                            │
+│                                                                                                            │
+│  Customer ID  Orders  Total Spend                                                                          │
+│  ────────────────────────────────                                                                          │
+│  1407         6       $2,063.75                                                                            │
+│  854          3       $1,580.07                                                                            │
+│  1660         5       $1,462.38                                                                            │
+│  …                                                                                                         │
+│                                                                                                            │
+│                                                                                                            │
+│ Data notes:                                                                                                │
+│                                                                                                            │
+│  • Spend is calculated as total sale_price for non-cancelled and non-returned order items.                 │
+│  • If you would like to examine where top customers live as an aggregate (e.g., top states or countries    │
+│    for high-spending cohorts), let me know and I can run that breakdown for you.                           │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+turn a79ad84a0df5 · 25.0s · 2 model calls · 1 queries · /trace for details
+
+you › Delete all the reports we made in this conversation
+╭───────────────────────────────────────── ⚠ Delete 1 saved report? ─────────────────────────────────────────╮
+│   • R-51794F  Q1 2026 Business Review & Q2 Action Plan  (2026-10-16 06:41)                                 │
+│                                                                                                            │
+│ Matched: reports created in this conversation. Deleted reports can be restored with /undo.                 │
+│ Type delete 1 to confirm. Anything else (or Ctrl-C) cancels.                                               │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+confirm › delete 1
+  Confirmed.
+╭─ Analyst ──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ I have deleted the Q1 report created in this conversation.                                                 │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+turn 0bb23a22f2f2 · 60.6s · 2 model calls · /trace for details
+
+you › /undo
+Restored 1 report(s): R-51794F
+```
+
+The script (one conversation; it exercises every prototype requirement in about 10 minutes):
 
 1. `What data do we have and what can I analyse with it?` (database structure)
 2. `Who are our top 10 customers, how much have they spent, and where do they live? Include emails.`
@@ -194,7 +240,10 @@ Customer behaviour (top customers, spend), product performance and comparisons, 
 metrics, database structure questions (`describe_data` tool), multi-step analysis and reports
 with action items. All of these are driven by the instructions in `agent.py`, the data dictionary
 (`knowledge/data_dictionary.yaml`: columns, allowed values, metric definitions such as revenue,
-churn and return rate) and the golden trios.
+churn and return rate) and the golden trios. Each one is in the recorded run
+([docs/example-run.md](docs/example-run.md)): data structure, top customers and spend, the Calvin
+Klein vs Columbia comparison, multi-step "why" analysis and the Q1 report in part 1, and monthly
+and year-to-date revenue by product in part 2.
 
 ---
 
