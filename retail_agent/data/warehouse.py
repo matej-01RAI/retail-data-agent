@@ -304,6 +304,15 @@ class DuckDBWarehouse:
                 child = node.args.get(arg)
                 if isinstance(child, exp.Binary):
                     child.replace(exp.Paren(this=child.copy()))
+        # BigQuery resolves a GROUP BY name to a SELECT alias before a column of the same name
+        # (`p.id AS product_id ... GROUP BY product_id`), as the guard's analysis does; DuckDB picks
+        # the column. Group by the aliased expression instead.
+        for select in tree.find_all(exp.Select):
+            group = select.args.get("group")
+            aliases = {e.alias.casefold(): e.this for e in select.expressions if isinstance(e, exp.Alias)}
+            for node in list(group.expressions) if group else []:
+                if isinstance(node, exp.Column) and not node.table and node.name.casefold() in aliases:
+                    node.replace(aliases[node.name.casefold()].copy())
         return tree.sql(dialect="duckdb")
 
     def query(self, sql: str, *, labels: dict[str, str], max_rows: int) -> QueryResult:
