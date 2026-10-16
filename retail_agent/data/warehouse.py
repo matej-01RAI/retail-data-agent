@@ -16,6 +16,7 @@ fault injection for demos and tests.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
@@ -38,7 +39,7 @@ class QueryError(Exception):
 
     @property
     def fixable_by_model(self) -> bool:
-        return self.kind in ("invalid_sql", "too_expensive")
+        return self.kind in ("invalid_sql", "too_expensive", "timeout")
 
     @property
     def transient(self) -> bool:
@@ -69,9 +70,14 @@ class Warehouse(Protocol):
 
 
 def _plain(value: Any) -> Any:
-    """Make a DataFrame cell JSON-friendly (and compact) for the model."""
-    if isinstance(value, (list, dict, tuple)):
-        return value
+    """Make a DataFrame cell JSON-friendly (and compact) for the model. ARRAY and STRUCT cells
+    arrive as numpy arrays, lists and dicts; their elements are converted too."""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if getattr(value, "ndim", 0):  # numpy array
+        return [_plain(v) for v in value.tolist()]
     if value is None or pd.isna(value):
         return None
     if hasattr(value, "isoformat"):
@@ -90,17 +96,52 @@ def _frame_to_rows(df: pd.DataFrame, max_rows: int) -> tuple[list[str], list[lis
 
 # --------------------------------------------------------------------------- BigQuery
 
+BIGQUERY_SCOPES = ("https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/cloud-platform")
+
+
+def service_account_credentials(raw: str):
+    """Credentials from a service-account key held in memory (GCP_SA_KEY_JSON); nothing touches disk.
+
+    A key that is set but unusable is an error, not a silent fall back to another login. The
+    message never includes the key's content."""
+    from google.oauth2 import service_account
+
+    try:
+        info = json.loads(raw)
+    except ValueError:
+        raise ValueError("GCP_SA_KEY_JSON is set but is not valid JSON. Paste the whole key file, or unset it.") from None
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise ValueError("GCP_SA_KEY_JSON is set but is not a service-account key (\"type\": \"service_account\").")
+    try:
+        return service_account.Credentials.from_service_account_info(info, scopes=BIGQUERY_SCOPES)
+    except (ValueError, KeyError) as e:
+        missing = str(e) if "missing fields" in str(e) else type(e).__name__
+        raise ValueError(f"GCP_SA_KEY_JSON is set but the key is not usable ({missing}).") from None
+
 
 class BigQueryWarehouse:
     name = "bigquery"
 
-    def __init__(self, project: str | None, dataset: str, max_bytes_billed: int, timeout_s: float):
+    def __init__(
+        self,
+        project: str | None,
+        dataset: str,
+        max_bytes_billed: int,
+        timeout_s: float,
+        service_account_json: str | None = None,
+    ):
         from google.cloud import bigquery  # imported lazily: offline mode does not need credentials
 
         from .bigquery_runner import BigQueryRunner
 
         self._bq = bigquery
-        self.runner = BigQueryRunner(project_id=project, dataset_id=dataset)
+        credentials = None
+        self.credentials_source = "application default credentials"
+        if service_account_json:
+            credentials = service_account_credentials(service_account_json)
+            project = project or credentials.project_id
+            self.credentials_source = f"service-account key from GCP_SA_KEY_JSON ({credentials.service_account_email})"
+        self.runner = BigQueryRunner(project_id=project, dataset_id=dataset, credentials=credentials)
         self.dataset = dataset
         self.max_bytes_billed = max_bytes_billed
         self.timeout_s = timeout_s
@@ -123,7 +164,7 @@ class BigQueryWarehouse:
         try:
             # 1) Dry run: free, catches syntax/semantic errors, and lets us check
             #    statement type, referenced tables and bytes before paying.
-            dry = self.runner.dry_run(sql)
+            dry = self.runner.dry_run(sql, timeout=min(30.0, self.timeout_s))
             if (dry.statement_type or "SELECT").upper() != "SELECT":
                 raise QueryError("invalid_sql", f"Only SELECT statements may run (got {dry.statement_type}).")
             project, dataset = self.dataset.split(".", 1)
@@ -149,6 +190,8 @@ class BigQueryWarehouse:
             message = _bq_message(e)
             if "bytesBilledLimitExceeded" in str(e) or "bytes billed" in message.lower():
                 raise QueryError("too_expensive", message) from e
+            if "timed out" in message.lower() or "jobTimeout" in str(e):
+                raise self._timeout() from e
             raise QueryError("invalid_sql", message) from e
         except gexc.Forbidden as e:
             message = _bq_message(e)
@@ -162,14 +205,17 @@ class BigQueryWarehouse:
             gexc.GatewayTimeout,
             gexc.DeadlineExceeded,
             gexc.RetryError,
-            TimeoutError,
             ConnectionError,
         ) as e:
             raise QueryError("unavailable", _bq_message(e)) from e
-        except Exception as e:  # concurrent.futures.TimeoutError, auth errors, ...
+        except Exception as e:  # TimeoutError (= concurrent.futures.TimeoutError), auth errors, ...
             name = type(e).__name__
-            if "Timeout" in name:
-                raise QueryError("unavailable", f"BigQuery timed out after {self.timeout_s:.0f}s") from e
+            if isinstance(e, TimeoutError) or "Timeout" in name:
+                # The query used its whole time budget: a heavy query, which a retry would bill again.
+                # A network read timeout well before that is an outage blip, retried as usual.
+                if time.monotonic() - started >= 0.9 * self.timeout_s:
+                    raise self._timeout() from e
+                raise QueryError("unavailable", f"{name}: {_bq_message(e)}") from e
             if "DefaultCredentialsError" in name or "RefreshError" in name:
                 raise QueryError("permission", f"Google Cloud credentials are not configured ({name}).") from e
             raise QueryError("unavailable", f"{name}: {e}") from e
@@ -182,6 +228,13 @@ class BigQueryWarehouse:
             cache_hit=bool(df.attrs.get("cache_hit")),
             elapsed_ms=int((time.monotonic() - started) * 1000),
             job_id=df.attrs.get("job_id"),
+        )
+
+    def _timeout(self) -> QueryError:
+        return QueryError(
+            "timeout",
+            f"BigQuery stopped the query after {self.timeout_s:.0f}s. Aggregate in SQL, narrow the date range or "
+            "select fewer columns.",
         )
 
 
@@ -245,6 +298,12 @@ class DuckDBWarehouse:
             if (table.catalog or "").lower() == self.project.lower() and (table.db or "").lower() == self.dataset.lower():
                 table.set("catalog", None)
                 table.set("db", None)
+        # sqlglot writes DIV(a - 1, 5) as `a - 1 // 5` for DuckDB, where // binds tighter: keep the grouping.
+        for node in list(tree.find_all(exp.IntDiv)):
+            for arg in ("this", "expression"):
+                child = node.args.get(arg)
+                if isinstance(child, exp.Binary):
+                    child.replace(exp.Paren(this=child.copy()))
         return tree.sql(dialect="duckdb")
 
     def query(self, sql: str, *, labels: dict[str, str], max_rows: int) -> QueryResult:
@@ -344,7 +403,7 @@ class ResilientWarehouse:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 cached: QueryResult = self._cache[key]
-                return QueryResult(**{**cached.__dict__, "cache_hit": True, "elapsed_ms": 0}), 0
+                return QueryResult(**{**cached.__dict__, "cache_hit": True, "elapsed_ms": 0, "bytes_processed": 0}), 0
         if not self.breaker.allow():
             raise QueryError(
                 "unavailable",

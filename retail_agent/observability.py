@@ -21,6 +21,8 @@ its full trace.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import statistics
 import threading
 from dataclasses import dataclass, field
@@ -31,9 +33,17 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
 
+from .safety.pii import scrub
 from .store import Database, now_iso
 
+logger = logging.getLogger(__name__)
+
 _MAX_ATTR = 8000
+_TURN_ID = re.compile(r"[0-9a-f]{4,32}")
+
+
+def _scrub_value(value: Any) -> Any:
+    return scrub(value).text if isinstance(value, str) else value
 
 
 class JsonlSpanExporter(SpanExporter):
@@ -52,7 +62,8 @@ class JsonlSpanExporter(SpanExporter):
             for key, value in (span.attributes or {}).items():
                 if key.startswith("logfire."):
                     continue
-                text = value if isinstance(value, (int, float, bool)) else str(value)
+                # Spans carry messages, SQL and errors: PII-scrubbed like everything else stored.
+                text = value if isinstance(value, (int, float, bool)) else scrub(str(value)).text
                 if isinstance(text, str) and len(text) > _MAX_ATTR:
                     text = text[:_MAX_ATTR] + "…"
                 attrs[key] = text
@@ -66,11 +77,18 @@ class JsonlSpanExporter(SpanExporter):
                 "duration_ms": round(((span.end_time or 0) - (span.start_time or 0)) / 1e6, 1),
                 "status": span.status.status_code.name,
                 "attributes": attrs,
-                "events": [{"name": e.name, "attributes": dict(e.attributes or {})} for e in span.events],
+                "events": [
+                    {"name": e.name, "attributes": {k: _scrub_value(v) for k, v in (e.attributes or {}).items()}}
+                    for e in span.events
+                ],
             }, default=str))
-        with self._lock, self.path.open("a") as f:
-            for line in lines:
-                f.write(line + "\n")
+        try:
+            with self._lock, self.path.open("a") as f:
+                for line in lines:
+                    f.write(line + "\n")
+        except OSError as e:
+            logger.warning("could not write spans to %s: %s", self.path, e)
+            return SpanExportResult.FAILURE
         return SpanExportResult.SUCCESS
 
     def shutdown(self) -> None:
@@ -96,6 +114,8 @@ class TurnStats:
     bytes_processed: int = 0
     pii_redactions: int = 0
     precedents: list[str] = field(default_factory=list)
+    # Changes made this turn (e.g. reports deleted), reported even if the turn then fails.
+    side_effects: list[str] = field(default_factory=list)
     _failed_since_success: bool = False
 
     def sql_failed(self) -> None:
@@ -116,10 +136,22 @@ class Telemetry:
         self.provider = provider
         self.spans_path = spans_path
         self.tracer = (provider or trace.get_tracer_provider()).get_tracer("retail_agent")
+        self.write_failures = 0
 
     def flush(self) -> None:
         if self.provider:
-            self.provider.force_flush()
+            try:
+                self.provider.force_flush()
+            except Exception as e:  # noqa: BLE001 - telemetry never breaks a turn
+                logger.warning("could not flush spans: %s", e)
+
+    def _write(self, sql: str, params: list[Any]) -> None:
+        """Best effort: a telemetry failure (disk full, database locked) is logged, never raised."""
+        try:
+            self.db.execute(sql, params)
+        except Exception as e:  # noqa: BLE001
+            self.write_failures += 1
+            logger.warning("telemetry write failed: %s", e)
 
     # ------------------------------------------------------------------ writes
 
@@ -138,18 +170,19 @@ class Telemetry:
         attempts: int | None = None,
         cache_hit: bool = False,
     ) -> None:
-        self.db.execute(
+        self._write(
             "INSERT INTO sql_events (turn_id, ts, purpose, sql, status, error_kind, error, rows, bytes, "
             "elapsed_ms, attempts, cache_hit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            [turn_id, now_iso(), purpose, sql, status, error_kind, error, rows, bytes_processed, elapsed_ms,
-             attempts, int(cache_hit)],
+            [turn_id, now_iso(), _scrub_value(purpose), _scrub_value(sql), status, error_kind, _scrub_value(error),
+             rows, bytes_processed, elapsed_ms, attempts, int(cache_hit)],
         )
 
     def record_turn(self, **row: Any) -> None:
+        """Free text (question, error, messages_json) must arrive scrubbed: see scrub_messages()."""
         row.setdefault("ts", now_iso())
         cols = ", ".join(row)
         marks = ", ".join("?" * len(row))
-        self.db.execute(f"INSERT OR REPLACE INTO turns ({cols}) VALUES ({marks})", list(row.values()))
+        self._write(f"INSERT OR REPLACE INTO turns ({cols}) VALUES ({marks})", list(row.values()))
 
     # ------------------------------------------------------------------ reads
 
@@ -163,8 +196,16 @@ class Telemetry:
         params.append(limit)
         return [dict(r) for r in self.db.query(sql, params)]
 
-    def turn_detail(self, turn_id: str) -> dict[str, Any] | None:
-        rows = self.db.query("SELECT * FROM turns WHERE turn_id LIKE ?", [turn_id + "%"])
+    def turn_detail(self, turn_id: str, user_id: str | None = None) -> dict[str, Any] | None:
+        """A turn by id or id prefix (hex only, so no LIKE wildcards); only `user_id`'s turns when given."""
+        turn_id = turn_id.strip().lower()
+        if not _TURN_ID.fullmatch(turn_id):
+            return None
+        sql, params = "SELECT * FROM turns WHERE turn_id LIKE ?", [turn_id + "%"]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        rows = self.db.query(sql + " ORDER BY ts DESC LIMIT 1", params)
         if not rows:
             return None
         turn = dict(rows[0])
@@ -184,8 +225,11 @@ class Telemetry:
         with self.spans_path.open() as f:
             for line in f:
                 if trace_id in line:
-                    span = json.loads(line)
-                    if span["trace_id"] == trace_id:
+                    try:
+                        span = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # a line cut short by a crash
+                    if span.get("trace_id") == trace_id:
                         out.append(span)
         out.sort(key=lambda s: s["start"] or 0)
         return out

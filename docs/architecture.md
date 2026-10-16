@@ -26,14 +26,14 @@ reports. The system must:
 | A1 | Cloud | GCP: the data is in BigQuery and Gemini is preferred. Single region (EU or US to match the data). |
 | A2 | Identity | Company SSO via an OIDC/SAML IdP (Google Workspace, Okta or Entra), federated into GCP. |
 | A3 | Entitlements | **Confirmed:** each manager analyses only their own brands; the CEO sees everything. Customer and order data are visible only through purchases of in-scope products. The manager-to-brands mapping is ours to define: a config file in the prototype, an access table in production. (The model also supports category and department scopes.) |
-| A4 | PII | **Confirmed:** first name, last name, email, street address, postal code and exact coordinates never appear in output or reach the LLM. City, state, country, age, gender and traffic source only in aggregates. Customers are referenced by `user_id` or a stable salted-hash pseudonym. We add a minimum group size of 5 in production. |
+| A4 | PII | **Confirmed:** first name, last name, email, street address, postal code and exact coordinates never appear in output or reach the LLM. City, state, country, age, gender and traffic source only in aggregates. Customers are referenced by `user_id` or a stable salted-hash pseudonym. We add a minimum group size of 5 (enforced by the prototype's guard, and by BigQuery aggregation thresholds in production). |
 | A5 | LLM data handling | Raw PII must not be sent to the LLM provider, even under enterprise terms. |
 | A6 | Definitions | Revenue excludes Cancelled and Returned lines. Churn = no order within 90 days. Calendar quarters. All held in the semantic layer, owned by the data team. |
 | A7 | Golden bucket | JSON trios in GCS, curated by an analyst team that can review agent-proposed candidates. |
 | A8 | Reports | Private to their owner by default (sharing is an extension). Soft delete with a 30-day restore window satisfies "strict confirmation". |
 | A9 | Scale | Tens to low hundreds of executives, peak ~20 concurrent conversations, first token < 3 s, typical answer < 30 s. |
 | A10 | Front end | Web app first (SSE streaming); Slack/Teams are adapters over the same API. The prototype is a CLI. |
-| A11 | Retention | Conversations and traces 90 days, audit log 2 years, preferences until the user resets them. |
+| A11 | Retention | Conversations and logs 90 days, traces 30 days, audit log 2 years, preferences until the user resets them. |
 | A12 | Language | English. |
 
 ## 2. Architecture

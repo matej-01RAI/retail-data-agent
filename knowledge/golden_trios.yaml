@@ -25,12 +25,13 @@ trios:
       FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
       WHERE oi.status NOT IN ('Cancelled', 'Returned')
         AND DATE(oi.created_at) >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 12 MONTH)
+        AND DATE(oi.created_at) < DATE_TRUNC(CURRENT_DATE(), MONTH)
       GROUP BY month
       ORDER BY month
     report: >-
-      Revenue is net of cancelled and returned lines. The current month is partial: either
-      exclude it or compare month-to-date with the same days of the prior month, never a full
-      month. Explain changes as orders x average order value so the reader sees whether growth
+      Revenue is net of cancelled and returned lines. The query covers the last 12 complete
+      months: the current month is partial, so if it is asked about, compare month-to-date with
+      the same days of the prior month, never with a full month. Explain changes as orders x average order value so the reader sees whether growth
       came from more orders or bigger baskets. Q4 seasonality is strong, so compare with the
       same month last year before calling a trend.
 
@@ -61,23 +62,16 @@ trios:
     question: Why are users in Texas underspending compared to users in California?
     tags: [state, underspending, spend per customer, compare segments, region, geography, why, frequency, basket]
     sql: |
-      WITH customer_spend AS (
-        SELECT u.state, oi.user_id,
-               COUNT(DISTINCT oi.order_id) AS orders,
-               SUM(oi.sale_price) AS spend
-        FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
-        JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
-        WHERE oi.status NOT IN ('Cancelled', 'Returned')
-          AND u.state IN ('Texas', 'California')
-        GROUP BY u.state, oi.user_id
-      )
-      SELECT state,
-             COUNT(*) AS customers,
-             ROUND(AVG(spend), 2) AS spend_per_customer,
-             ROUND(AVG(orders), 2) AS orders_per_customer,
-             ROUND(SAFE_DIVIDE(SUM(spend), SUM(orders)), 2) AS avg_order_value
-      FROM customer_spend
-      GROUP BY state
+      SELECT u.state,
+             COUNT(DISTINCT oi.user_id) AS customers,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT oi.user_id)), 2) AS spend_per_customer,
+             ROUND(SAFE_DIVIDE(COUNT(DISTINCT oi.order_id), COUNT(DISTINCT oi.user_id)), 2) AS orders_per_customer,
+             ROUND(SAFE_DIVIDE(SUM(oi.sale_price), COUNT(DISTINCT oi.order_id)), 2) AS avg_order_value
+      FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
+      JOIN `bigquery-public-data.thelook_ecommerce.users` AS u ON u.id = oi.user_id
+      WHERE oi.status NOT IN ('Cancelled', 'Returned')
+        AND u.state IN ('Texas', 'California')
+      GROUP BY u.state
     report: >-
       "Underspending" needs a baseline: compare both states with each other and with the national
       average. Decompose spend per customer = orders per customer x average order value; that
@@ -96,7 +90,7 @@ trios:
         ROUND(SAFE_DIVIDE(SUM(IF(oi.status NOT IN ('Cancelled', 'Returned'), oi.sale_price - p.cost, 0)),
                           SUM(IF(oi.status NOT IN ('Cancelled', 'Returned'), oi.sale_price, 0))), 3) AS margin_pct,
         ROUND(SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'),
-                          COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned'))), 3) AS return_rate,
+                          COUNTIF(oi.status IN ('Complete', 'Returned'))), 3) AS return_rate,
         ROUND(AVG(oi.sale_price), 2) AS avg_selling_price,
         COUNT(DISTINCT oi.user_id) AS customers,
         COUNT(DISTINCT p.id) AS products_sold
@@ -200,18 +194,19 @@ trios:
     tags: [returns, return rate, category, quality, fit, refunds]
     sql: |
       SELECT p.category,
-             COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned')) AS shipped_items,
+             COUNTIF(oi.status IN ('Complete', 'Returned')) AS delivered_items,
              COUNTIF(oi.status = 'Returned') AS returned_items,
              ROUND(SAFE_DIVIDE(COUNTIF(oi.status = 'Returned'),
-                               COUNTIF(oi.status IN ('Shipped', 'Complete', 'Returned'))), 3) AS return_rate,
+                               COUNTIF(oi.status IN ('Complete', 'Returned'))), 3) AS return_rate,
              ROUND(SUM(IF(oi.status = 'Returned', oi.sale_price, 0)), 2) AS returned_revenue
       FROM `bigquery-public-data.thelook_ecommerce.order_items` AS oi
       JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
       GROUP BY p.category
-      HAVING shipped_items >= 50
+      HAVING delivered_items >= 50
       ORDER BY return_rate DESC
     report: >-
-      Return rate is returned / shipped items (cancelled and processing lines never shipped).
+      Return rate is returned / delivered items (Complete + Returned): cancelled, processing and
+      in-transit lines cannot have been returned yet.
       Ignore categories with small volumes (the HAVING clause). Pair the rate with returned
       revenue: the action priority is where both are high. Apparel fit categories (jeans,
       dresses, swim) typically lead; size guides and fit notes are the usual levers.
@@ -247,9 +242,10 @@ trios:
         JOIN `bigquery-public-data.thelook_ecommerce.products` AS p ON p.id = oi.product_id
         WHERE oi.status NOT IN ('Cancelled', 'Returned')
       ),
-      first_purchase AS (
-        SELECT user_id, MIN(quarter) AS first_quarter
-        FROM lines
+      first_purchase AS (  -- "new" = first non-cancelled order (data dictionary)
+        SELECT user_id, MIN(DATE_TRUNC(DATE(created_at), QUARTER)) AS first_quarter
+        FROM `bigquery-public-data.thelook_ecommerce.orders`
+        WHERE status != 'Cancelled'
         GROUP BY user_id
       )
       SELECT CONCAT(CAST(EXTRACT(YEAR FROM l.quarter) AS STRING), '-Q',
@@ -303,14 +299,16 @@ trios:
       SELECT FORMAT_DATE('%Y-%m', DATE(created_at)) AS month,
              ROUND(AVG(TIMESTAMP_DIFF(shipped_at, created_at, HOUR)) / 24, 2) AS avg_days_to_ship,
              ROUND(AVG(TIMESTAMP_DIFF(delivered_at, shipped_at, HOUR)) / 24, 2) AS avg_days_in_transit,
-             ROUND(SAFE_DIVIDE(COUNTIF(status = 'Returned'), COUNTIF(delivered_at IS NOT NULL)), 3) AS return_rate_of_delivered
+             ROUND(SAFE_DIVIDE(COUNTIF(status = 'Returned'), COUNTIF(status IN ('Complete', 'Returned'))), 3) AS return_rate
       FROM `bigquery-public-data.thelook_ecommerce.orders`
       WHERE DATE(created_at) >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 6 MONTH)
+        AND DATE(created_at) < DATE_TRUNC(CURRENT_DATE(), MONTH)
       GROUP BY month
       ORDER BY month
     report: >-
       Measure ship time from order to shipment and transit from shipment to delivery separately:
-      they have different owners (warehouse vs carrier). Correlation with returns over a few
+      they have different owners (warehouse vs carrier). Return rate uses the standard definition
+      (returned / delivered); the latest months look low because returns arrive weeks after delivery. Correlation with returns over a few
       months is weak evidence; say so, and suggest a cohort comparison (fast vs slow deliveries).
 
   - id: GK-012

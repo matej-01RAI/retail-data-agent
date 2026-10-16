@@ -29,7 +29,14 @@ from pydantic_ai.exceptions import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelRequest, ModelResponse, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from . import approvals
@@ -41,6 +48,8 @@ from .safety.input_guard import screen
 from .safety.pii import scrub
 
 logger = logging.getLogger(__name__)
+
+APPROVAL_HEADROOM = 3  # model requests always available after the user confirms an action
 
 
 class UI(Protocol):
@@ -70,6 +79,7 @@ FRIENDLY = {
     "model name or permissions), so retrying won't help. Please ask an administrator to check the setup "
     "(`python -m retail_agent doctor`).",
     "model_error": "I got confused putting that answer together. Please try again, perhaps rephrasing the question.",
+    "interrupted": "Stopped, as you asked. Ask again whenever you're ready.",
     "error": "Something went wrong on my side and the answer was not completed. Please try again.",
 }
 
@@ -126,9 +136,8 @@ class Assistant:
             outcome, error_type, reply = "answered", None, ""
             new_messages: list[ModelMessage] = []
             try:
-                output, all_messages = await self._run(decision.text, deps, usage, limits)
+                output, all_messages, new_messages = await self._run(decision.text, deps, usage, limits)
                 reply = output
-                new_messages = all_messages[len(self.history):]
                 self.history = all_messages
             except UsageLimitExceeded as e:
                 outcome, error_type = "limit", f"UsageLimitExceeded: {e}"
@@ -140,12 +149,28 @@ class Assistant:
                 error_type = _describe(e)
             except UnexpectedModelBehavior as e:
                 outcome, error_type = "model_error", _describe(e)
+            except asyncio.CancelledError:
+                # Ctrl-C in the CLI: end this turn cleanly (recorded, side effects reported), keep the session.
+                task = asyncio.current_task()
+                if task is not None:
+                    task.uncancel()
+                outcome, error_type = "interrupted", "Interrupted by the user"
             except Exception as e:  # never crash the UI
                 logger.exception("turn %s failed", turn_id)
                 outcome, error_type = "error", _describe(e)
             if outcome != "answered":
+                deps.stop()  # tool threads still running stop here; a change in progress finishes first
                 reply = FRIENDLY[outcome]
                 span.set_attribute("app.error", error_type or "")
+                if stats.side_effects:
+                    # A confirmed action already ran (e.g. reports deleted): say so, and record the
+                    # turn in the history so the next question knows too.
+                    reply += "\n\n**Done before this stopped:** " + " ".join(stats.side_effects)
+                    new_messages = [
+                        ModelRequest(parts=[UserPromptPart(decision.text)]),
+                        ModelResponse(parts=[TextPart(reply)]),
+                    ]
+                    self.history = [*self.history, *new_messages]
 
             clean = scrub(reply)
             stats.pii_redactions += clean.redacted
@@ -159,7 +184,8 @@ class Assistant:
 
     async def _run(
         self, prompt: str, deps: Deps, usage: RunUsage, limits: UsageLimits
-    ) -> tuple[str, list[ModelMessage]]:
+    ) -> tuple[str, list[ModelMessage], list[ModelMessage]]:
+        """Returns (answer, history to keep, this turn's messages)."""
         timeout = self.services.settings.turn_timeout_s
         history = self._trimmed_history()
         result = await asyncio.wait_for(
@@ -168,17 +194,23 @@ class Assistant:
         # Paused for approval: resolve with the human (no timeout on their thinking time), then resume.
         while isinstance(result.output, DeferredToolRequests):
             deferred = await self._resolve_approvals(result.output, deps)
+            # Headroom for the model to report the outcome, however many requests the turn has used.
+            resume_limits = UsageLimits(
+                request_limit=max(limits.request_limit or 0, usage.requests + APPROVAL_HEADROOM),
+                total_tokens_limit=limits.total_tokens_limit,
+            )
             result = await asyncio.wait_for(
                 self.agent.run(
                     message_history=result.all_messages(),
                     deferred_tool_results=deferred,
                     deps=deps,
                     usage=usage,
-                    usage_limits=limits,
+                    usage_limits=resume_limits,
                 ),
                 timeout,
             )
-        return str(result.output), result.all_messages()
+        messages = result.all_messages()
+        return str(result.output), messages, messages[len(history):]
 
     async def _resolve_approvals(self, requests: DeferredToolRequests, deps: Deps) -> DeferredToolResults:
         out = DeferredToolResults()
@@ -212,6 +244,8 @@ class Assistant:
     def _trimmed_history(self) -> list[ModelMessage]:
         """Keep the last N user turns (cut only at a user prompt, so tool call/return pairs stay intact)."""
         keep = self.services.settings.history_turns
+        if keep <= 0:
+            return []
         starts = [
             i for i, m in enumerate(self.history)
             if isinstance(m, ModelRequest) and any(isinstance(p, UserPromptPart) for p in m.parts)
@@ -237,10 +271,7 @@ class Assistant:
         fallback_used: int,
     ) -> None:
         models = sorted({m.model_name for m in messages if isinstance(m, ModelResponse) and m.model_name})
-        try:
-            messages_json = ModelMessagesTypeAdapter.dump_json(messages).decode() if messages else None
-        except Exception:
-            messages_json = None
+        messages_json = scrub_messages(messages)
         self.services.telemetry.record_turn(
             turn_id=turn_id,
             user_id=self.user.id,
@@ -248,7 +279,7 @@ class Assistant:
             trace_id=trace_id,
             question=scrub(question).text[:2000],  # blocked prompts arrive unmasked
             outcome=outcome,
-            error_type=(error_type or None) and error_type[:500],
+            error_type=(error_type or None) and scrub(error_type).text[:500],
             latency_ms=latency_ms,
             llm_requests=usage.requests,
             input_tokens=usage.input_tokens,
@@ -267,6 +298,27 @@ class Assistant:
             precedents=json.dumps(stats.precedents),
             messages_json=messages_json,
         )
+
+
+def scrub_messages(messages: list[ModelMessage]) -> str | None:
+    """The turn's messages as JSON for /trace, with PII masked in every prompt, reply, tool call and result."""
+    if not messages:
+        return None
+
+    def clean(value, free_text: bool = False):
+        if isinstance(value, dict):
+            return {k: clean(v, free_text or k in ("content", "args")) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clean(v, free_text) for v in value]
+        if free_text and isinstance(value, str):
+            return scrub(value).text
+        return value
+
+    try:
+        return json.dumps(clean(ModelMessagesTypeAdapter.dump_python(messages, mode="json")))
+    except Exception:  # noqa: BLE001 - observability must not fail the turn
+        logger.warning("could not serialise the turn's messages", exc_info=True)
+        return None
 
 
 def _config_error(error: BaseException) -> bool:

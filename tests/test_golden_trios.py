@@ -62,3 +62,16 @@ def test_retrieval_finds_the_right_precedent(question, expected):
 
 def test_off_topic_retrieves_nothing():
     assert GOLDEN.search("what's the weather in Paris") == []
+
+
+def test_sample_data_has_no_future_events(sample_db):
+    import duckdb
+
+    conn = duckdb.connect(str(sample_db), read_only=True)
+    for table, columns in {"users": ["created_at"], "orders": ["created_at", "shipped_at", "delivered_at", "returned_at"]}.items():
+        for column in columns:
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} > now()").fetchone()[0] == 0, (table, column)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE (status = 'Returned') != (returned_at IS NOT NULL)"
+    ).fetchone()[0] == 0
+    conn.close()

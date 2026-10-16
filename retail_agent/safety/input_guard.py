@@ -16,17 +16,25 @@ template so security can tune it without a deploy.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from .pii import scrub
 
 MAX_INPUT_CHARS = 4000
 
+# "show your rules" is an attack; "show your rules for revenue" is a question about definitions.
+_ENDS_REQUEST = r"(?=\s*(?:$|[.,!?;:]|and\b|please\b|now\b|verbatim\b|in\s+full\b|word\s+for\s+word\b|to\s+me\b))"
+
 _INJECTION_PATTERNS = [
-    r"\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|prompts?)",
+    r"\bignore\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+|my\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|prompts?)",
+    r"\bignore\s+(?:all\s+)?(?:the|your|these|those)\s+(?:instructions|rules)\s+(?:above|before)\b",
     r"\b(?:disregard|forget)\s+(?:all\s+|your\s+)?(?:previous\s+|prior\s+)?(?:instructions|rules|guidelines)",
-    r"\b(?:reveal|show|print|repeat|output)\s+(?:me\s+)?(?:(?:your|the)\s+(?:system|hidden)\s+prompt|your\s+(?:instructions|rules))",
+    r"\bforget\s+(?:everything|all)\s+(?:above|before|you\s+were\s+told)\b",
+    r"\b(?:reveal|show|print|repeat|output)\s+(?:me\s+)?(?:(?:your|the)\s+(?:system|hidden)\s+prompt|your\s+(?:instructions|rules))"
+    + _ENDS_REQUEST,
     r"\byou\s+are\s+now\s+(?:in\s+)?(?:developer|dan|jailbreak|god)\s*mode",
+    r"\byou\s+are\s+now\s+dan\b",
     r"\b(?:developer|jailbreak)\s+mode\s+(?:enabled|on)\b",
     r"\bact\s+as\s+(?:an?\s+)?(?:unrestricted|unfiltered)\b",
     r"\bpretend\s+(?:that\s+)?(?:there\s+are\s+)?no\s+(?:rules|restrictions)",
@@ -44,6 +52,14 @@ class InputDecision:
     reply: str | None = None  # canned reply when not allowed
 
 
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))
+
+
+def _normalised(text: str) -> str:
+    """For matching only: fold look-alike characters (full-width letters) and drop invisible ones."""
+    return unicodedata.normalize("NFKC", text).translate(_INVISIBLE)
+
+
 def screen(text: str) -> InputDecision:
     text = (text or "").strip()
     if not text:
@@ -56,7 +72,7 @@ def screen(text: str) -> InputDecision:
             reply=f"That message is too long ({len(text)} characters, limit {MAX_INPUT_CHARS}). "
             "Please shorten it or split it into separate questions.",
         )
-    if _INJECTION.search(text):
+    if _INJECTION.search(_normalised(text)):
         return InputDecision(
             False,
             text,

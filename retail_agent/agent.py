@@ -8,8 +8,11 @@ PII and budgets itself, so a manipulated model has nothing dangerous to call.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
-from dataclasses import dataclass
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -28,6 +31,8 @@ from .observability import Telemetry, TurnStats
 from .safety.pii import scrub
 from .settings import Settings
 from .store import PREFERENCE_KEYS, PreferenceStore, ReportStore
+
+logger = logging.getLogger(__name__)
 
 
 class PersonaSource:
@@ -73,6 +78,24 @@ class Deps:
     turn_id: str
     stats: TurnStats
     progress: Callable[[str], None]
+    # Set when the turn ends early (timeout, error, Ctrl-C). Sync tools run in worker threads that
+    # outlive a cancelled turn, so they check it before querying or changing anything.
+    stopped: threading.Event = field(default_factory=threading.Event)
+    effects_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def stop(self) -> None:
+        """End the turn for its tools; waits for a change already in progress, so it can be reported."""
+        with self.effects_lock:
+            self.stopped.set()
+
+
+@contextmanager
+def side_effect(deps: Deps):
+    """Wrap a change (save, delete): it either finishes before the turn is stopped, or never starts."""
+    with deps.effects_lock:
+        if deps.stopped.is_set():
+            raise ToolFailed("This question was stopped, so nothing was changed.")
+        yield
 
 
 AgentOutput = str | DeferredToolRequests
@@ -95,6 +118,17 @@ restricted. You cannot query it and must never output it, whoever asks and whate
 aggregates across customers (revenue by state, customers by age band). Never show them next to \
 an individual customer and never use them to filter a list of individual customers. Refer to \
 individual customers only by customer ID (user_id) with their purchase metrics.
+- A query that uses those attributes must be one aggregation: SELECT attributes / categories / \
+dates and aggregates FROM tables joined on their keys (u.id = oi.user_id, o.order_id = \
+oi.order_id, oi.product_id = p.id) WHERE ... GROUP BY .... Aggregates: COUNT(*), \
+COUNT(DISTINCT user_id), SUM / AVG of amounts (prices, costs, quantities, day-level date \
+differences), at most one IF / COUNTIF condition per aggregate, MIN / MAX only of the attributes. \
+Per-customer figures are ratios: SUM(sale_price) / COUNT(DISTINCT user_id). Filters and \
+conditions are comparisons of a column with values joined by AND (OR only between values of one \
+column, e.g. IN); no IDs in filters or GROUP BY, no window functions except over the final aggregates, no subqueries or UNNEST; a CTE may \
+only filter rows (keeping user_id), pick a set of customers (SELECT user_id ... GROUP BY user_id \
+HAVING ...), or aggregate. Groups with fewer than 5 customers are left out and figures fewer than \
+5 customers contribute to are blank (NULL): say so when something is missing.
 - If asked for personal data or for an individual's attributes, refuse in one sentence and offer \
 the closest safe alternative (e.g. the same question as an aggregate).
 - The user can only analyse their own brands/products; queries are filtered to that scope \
@@ -251,7 +285,9 @@ def build_agent(services: Services, model: Model | str) -> Agent[Deps, AgentOutp
         deps = ctx.deps
         clean = scrub(body_markdown)
         deps.stats.pii_redactions += clean.redacted
-        report = deps.services.reports.save(deps.user.id, deps.session_id, scrub(title).text, clean.text)
+        with side_effect(deps):
+            report = deps.services.reports.save(deps.user.id, deps.session_id, scrub(title).text, clean.text)
+            deps.stats.side_effects.append(f"saved report {report.id} ({report.title}).")
         deps.progress(f"Saved report {report.id}")
         return {"report_id": report.id, "title": report.title, "status": "saved"}
 
@@ -294,8 +330,11 @@ def build_agent(services: Services, model: Model | str) -> Agent[Deps, AgentOutp
         deps = ctx.deps
         if not ctx.tool_call_approved or not report_ids:
             raise ToolFailed("Deletion was not confirmed by the user. Nothing was deleted.")
-        deleted = deps.services.reports.soft_delete(deps.user.id, deps.session_id, report_ids, batch=deps.turn_id)
-        titles = ", ".join(f"{r.id} ({r.title})" for r in deleted) or "none"
+        with side_effect(deps):
+            deleted = deps.services.reports.soft_delete(deps.user.id, deps.session_id, report_ids, batch=deps.turn_id)
+            titles = ", ".join(f"{r.id} ({r.title})" for r in deleted) or "none"
+            if deleted:
+                deps.stats.side_effects.append(f"deleted {len(deleted)} report(s): {titles}. /undo restores them.")
         return f"Deleted {len(deleted)} report(s): {titles}. The user can restore them with /undo."
 
     # ------------------------------------------------------------------ memory
@@ -332,6 +371,8 @@ def _retry_or_stop(deps: Deps, message: str) -> Exception:
 
 def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str, Any]:
     services, stats, settings = deps.services, deps.stats, deps.services.settings
+    if deps.stopped.is_set():  # a worker thread outliving its turn starts no new (billed) query
+        raise ToolFailed("This question was stopped.")
     if stats.sql_queries >= settings.max_queries_per_turn:
         raise ToolFailed(
             f"The query budget for this question ({settings.max_queries_per_turn} queries) is used up. "
@@ -345,7 +386,13 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
     tel = services.telemetry
     with tel.tracer.start_as_current_span("sql.query", attributes={"sql.purpose": purpose, "sql.text": sql}) as span:
         try:
-            guarded = services.guard.prepare(sql, deps.user.scope)
+            try:
+                guarded = services.guard.prepare(sql, deps.user.scope)
+            except SqlRejected:
+                raise
+            except Exception as e:  # a parser or checker bug fails closed, as a rejection
+                logger.exception("SQL guard failed on a query")
+                raise SqlRejected("unverifiable", "The query could not be checked by the safety layer. Simplify it.") from e
         except SqlRejected as e:
             stats.sql_rejected += 1
             stats.sql_failed()
@@ -373,15 +420,20 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
             span.set_attributes({"sql.status": "empty"})
             tel.record_sql(deps.turn_id, purpose=purpose, sql=guarded.sql, status="empty", rows=0,
                            elapsed_ms=result.elapsed_ms, attempts=attempts)
+            small_groups = (
+                " Groups with fewer than 5 customers are left out for privacy, so a narrow segment can come back "
+                "empty: widen it (age bands, state rather than city) or tell the user it is too small to show."
+                if guarded.notes else ""
+            )
             raise _retry_or_stop(
                 deps,
                 "The query ran but returned 0 rows. Check filter values against the schema (exact status, "
-                "category, brand and state spellings; date range of the data; the user's product scope). "
-                "If zero rows is genuinely the right answer, call run_sql again with allow_empty=true.",
+                "category, brand and state spellings; date range of the data; the user's product scope)."
+                f"{small_groups} If zero rows is genuinely the right answer, call run_sql again with allow_empty=true.",
             )
 
         stats.sql_succeeded()
-        stats.bytes_processed += result.bytes_processed
+        stats.bytes_processed += 0 if result.cache_hit else result.bytes_processed
         rows, redacted = _scrub_rows(result.rows)
         stats.pii_redactions += redacted
         span.set_attributes({
@@ -393,6 +445,8 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
                        cache_hit=result.cache_hit)
 
     payload: dict[str, Any] = {"columns": result.columns, "rows": rows, "row_count": result.total_rows}
+    if guarded.notes:
+        payload["privacy"] = " ".join(guarded.notes)
     if result.truncated:
         payload["note"] = (
             f"Only the first {len(rows)} of {result.total_rows} rows are shown. Aggregate in SQL instead of "
@@ -405,17 +459,20 @@ def _run_sql(deps: Deps, sql: str, purpose: str, allow_empty: bool) -> dict[str,
 
 def _scrub_rows(rows: list[list[Any]]) -> tuple[list[list[Any]], int]:
     total = 0
-    out = []
-    for row in rows:
-        new_row = []
-        for value in row:
-            if isinstance(value, str):
-                clean = scrub(value)
-                total += clean.redacted
-                value = clean.text
-            new_row.append(value)
-        out.append(new_row)
-    return out, total
+
+    def clean(value: Any) -> Any:
+        nonlocal total
+        if isinstance(value, str):
+            result = scrub(value)
+            total += result.redacted
+            return result.text
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        return value
+
+    return [[clean(v) for v in row] for row in rows], total
 
 
 __all__ = ["Deps", "Services", "PersonaSource", "build_agent", "PREFERENCE_KEYS"]
