@@ -23,3 +23,25 @@ jobs:
       - run: pip install -r requirements-dev.txt
       # Offline: no API key and no Google Cloud project needed.
       - run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t retail-agent .
+      # The image starts the API with its built-in offline dataset (no model call is made).
+      - name: Smoke test
+        run: |
+          docker run -d --name api -p 8000:8000 -e GEMINI_API_KEY=unused \
+            -e API_TOKENS=ceo:ci-only-token-0123456789 retail-agent serve --host 0.0.0.0 --offline
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8000/healthz | grep -q duckdb; then
+              test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/v1/sessions)" = 401
+              test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer ci-only-token-0123456789' localhost:8000/v1/sessions)" = 201
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs api
+          exit 1

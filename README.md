@@ -47,6 +47,20 @@ python -m retail_agent sample-db
 python -m retail_agent --user ceo --offline
 ```
 
+**With Docker** (no local Python needed; the synthetic dataset is built into the image):
+
+```bash
+cp .env.example .env              # set GEMINI_API_KEY (and GOOGLE_CLOUD_PROJECT for BigQuery)
+docker build -t retail-agent .
+docker run -it --rm --env-file .env retail-agent --user ceo --offline
+docker run -it --rm --env-file .env -e GCP_SA_KEY_JSON="$(cat key.json)" retail-agent --user ceo    # BigQuery
+docker run --rm -p 8000:8000 --env-file .env retail-agent serve --host 0.0.0.0 --offline            # HTTP API
+```
+
+`.env` is read at run time and never copied into the image. In a container BigQuery needs a
+service-account key (`GCP_SA_KEY_JSON`, held in memory only). Add `-v retail-agent-data:/data` to
+keep saved reports and metrics between runs.
+
 **Tests** run fully offline, with no API key and no GCP project:
 
 ```bash
@@ -268,6 +282,7 @@ retail_agent/
   safety/
     input_guard.py      injection / size screening, PII masking of input
     pii.py              PII scrubber
+Dockerfile              one image for the CLI and the HTTP API (non-root, offline dataset included)
 config/users.yaml       demo identities and scopes
 config/persona.md       CEO-editable tone (hot-reloaded)
 knowledge/              data_dictionary.yaml, golden_trios.yaml
