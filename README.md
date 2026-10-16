@@ -271,8 +271,8 @@ Alternatives considered:
 - **Google ADK**: a strong fit for GCP-native deployment (Agent Engine); a reasonable choice
   for the production build.
 
-**My experience with it:** *TODO (Matej): state your level of experience with Pydantic AI, or
-with the framework you choose to present.*
+**My experience with it:** I have used Pydantic AI across multiple AI projects, so this build
+starts from a framework I know well.
 
 ---
 
