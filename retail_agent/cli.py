@@ -439,6 +439,12 @@ def doctor(args: argparse.Namespace) -> None:
             line(n > 0, f"Scope of '{user.id}' matches products", f"{user.scope.describe()}: {n} products")
     except Exception as e:  # noqa: BLE001
         line(False, "Warehouse", f"{type(e).__name__}: {str(e)[:300]}")
+        if getattr(e, "kind", None) == "permission" and "jobs.create" in str(e):
+            console.print(
+                f"  [yellow]Give the identity above the BigQuery Job User role in project {settings.gcp_project}: "
+                "in the Cloud Console pick that project, then IAM & Admin → IAM → Grant access. A role granted "
+                "in another project (for example the one AI Studio made for the Gemini key) does not count.[/yellow]"
+            )
     console.print("[green]All checks passed.[/green]" if ok else "[yellow]Some checks failed (see above).[/yellow]")
     if not ok:
         sys.exit(1)
