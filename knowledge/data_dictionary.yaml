@@ -118,4 +118,7 @@ notes:
   - All timestamps are UTC. Use DATE(created_at) for day-level grouping.
   - The dataset is synthetic and keeps growing; check MIN/MAX(created_at) before answering
     "last month" / "this year" questions and anchor them on CURRENT_DATE().
+  - The generator also writes rows dated a few days after today. Leave them out
+    (created_at <= CURRENT_TIMESTAMP()) of every to-date, month-to-date, year-to-date and
+    current-period figure, and never describe a period as running past today.
   - Quarters are calendar quarters (Q1 = Jan-Mar) unless the user says otherwise.

@@ -33,7 +33,8 @@ pip install -r requirements.txt
 
 cp .env.example .env              # then set GEMINI_API_KEY and GOOGLE_CLOUD_PROJECT
 gcloud auth application-default login                  # BigQuery credentials
-#   (no browser? put a service-account key in GCP_SA_KEY_JSON instead: used in memory, never written to disk)
+#   (no browser? put a service-account key in GCP_SA_KEY_JSON instead: used in memory, never written to disk;
+#    give that account the BigQuery Job User role in the GOOGLE_CLOUD_PROJECT project)
 
 python -m retail_agent doctor     # checks Python, Gemini, credentials, schema, a test query
 python -m retail_agent --user ceo # start chatting (other demo users: maria, tom)
@@ -153,40 +154,64 @@ and answers stream over SSE (docs/architecture.md).
 
 ## Example run
 
-A full recorded run is in **[docs/example-run.md](docs/example-run.md)**: real Gemini on the
-offline synthetic data (16 Oct 2026), plus the two time-based questions asked inside the Docker
-image. Two excerpts:
+Full recordings are in **[docs/example-run.md](docs/example-run.md)**, all with real Gemini:
+on **real BigQuery** (the doctor check, all 12 golden trios for every user, and the script below
+end to end), and on the offline synthetic data (the same script, plus the time-based questions
+inside the Docker image). Two excerpts from the BigQuery run:
 
 ```text
 you › Who are our top 10 customers, how much have they spent, and where do they live? Include their emails.
-  ↳ Querying: Get top 10 customers by spend and aggregate location breakdown for them
+  ↳ Querying: Get top 10 customers by total spend with purchase metrics (orders, total spend, order dates).
+  ↳ Querying: Get aggregate geographic distribution (country) for top 100 spenders.
+  ↳ Querying: Get revenue, customer count, and spend per customer by country across all customers. (attempt 2)
 ╭─ Analyst ──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ I cannot provide customer emails, street addresses, or individual locations, as personal data is           │
-│ restricted by company privacy policy.                                                                      │
+│ Under company data protection rules, personal data such as email addresses and individual customer         │
+│ locations cannot be disclosed, but I can present our top 10 customers by Customer ID alongside their       │
+│ purchase metrics, followed by our aggregate spend distribution by country.                                 │
 │                                                                                                            │
-│ However, I can share the top 10 customers by total spend along with their order counts and overall revenue │
-│ contribution:                                                                                              │
+│ ---------------------------------------------------------------------------------------------------------- │
+│                                                                                                            │
+│ Top 10 Customers by Total Spend                                                                            │
+│                                                                                                            │
+│ The top spender (Customer 88826) has accumulated $1,658.44 across 2 non-cancelled orders. High spend in    │
+│ our top tier is driven both by high-value single orders (e.g. Customer 29646 at $1,434.50 in 1 order) and  │
+│ repeat high-frequency purchases (e.g. Customer 17755 with 4 orders totalling $1,414.71).                   │
 │                                                                                                            │
 │                                                                                                            │
-│  Customer ID  Orders  Total Spend                                                                          │
-│  ────────────────────────────────                                                                          │
-│  1407         6       $2,063.75                                                                            │
-│  854          3       $1,580.07                                                                            │
-│  1660         5       $1,462.38                                                                            │
+│  Customer ID  Orders  Total Spend ($)  First Order  Last Order                                             │
+│  ─────────────────────────────────────────────────────────────                                             │
+│  88826        2       $1,658.44        2024-08-03   2026-05-07                                             │
+│  97483        2       $1,642.00        2022-06-05   2022-07-26                                             │
+│  16749        2       $1,538.75        2024-03-11   2025-06-10                                             │
 │  …                                                                                                         │
 │                                                                                                            │
 │                                                                                                            │
-│ Data notes:                                                                                                │
+│ Note: Spend includes non-cancelled, non-returned completed order lines.                                    │
 │                                                                                                            │
-│  • Spend is calculated as total sale_price for non-cancelled and non-returned order items.                 │
-│  • If you would like to examine where top customers live as an aggregate (e.g., top states or countries    │
-│    for high-spending cohorts), let me know and I can run that breakdown for you.                           │
+│ ---------------------------------------------------------------------------------------------------------- │
+│                                                                                                            │
+│ Aggregate Geographic Spend Distribution                                                                    │
+│                                                                                                            │
+│ To understand where our revenue originates geographically, below is the aggregate revenue breakdown for    │
+│ our top 10 customer markets:                                                                               │
+│                                                                                                            │
+│                                                                                                            │
+│  Country         Active Customers  Total Revenue ($)  Spend per Customer ($)                               │
+│  ───────────────────────────────────────────────────────────────────────────                               │
+│  China           22,398            $2,739,161.63      $122.29                                              │
+│  United States   14,978            $1,829,371.13      $122.14                                              │
+│  Brasil          9,625             $1,188,030.31      $123.43                                              │
+│  …                                                                                                         │
+│                                                                                                            │
+│                                                                                                            │
+│ Spend per customer remains consistent across all major geographic regions, averaging between $120.96 and   │
+│ $126.08.                                                                                                   │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-turn a79ad84a0df5 · 25.0s · 2 model calls · 1 queries · /trace for details
+turn a31b27c7a0b6 · 21.3s · 4 model calls · 3 queries (1 self-corrected) · /trace for details
 
 you › Delete all the reports we made in this conversation
 ╭───────────────────────────────────────── ⚠ Delete 1 saved report? ─────────────────────────────────────────╮
-│   • R-51794F  Q1 2026 Business Review & Q2 Action Plan  (2026-10-16 06:41)                                 │
+│   • R-5E0D9A  Q1 2026 Performance Review & Q2 Strategic Plan  (2026-10-17 06:08)                           │
 │                                                                                                            │
 │ Matched: reports created in this conversation. Deleted reports can be restored with /undo.                 │
 │ Type delete 1 to confirm. Anything else (or Ctrl-C) cancels.                                               │
@@ -194,12 +219,12 @@ you › Delete all the reports we made in this conversation
 confirm › delete 1
   Confirmed.
 ╭─ Analyst ──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ I have deleted the Q1 report created in this conversation.                                                 │
+│ All reports created in this conversation have been deleted successfully.                                   │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-turn 0bb23a22f2f2 · 60.6s · 2 model calls · /trace for details
+turn d090964f4074 · 65.7s · 2 model calls · /trace for details
 
 you › /undo
-Restored 1 report(s): R-51794F
+Restored 1 report(s): R-5E0D9A
 ```
 
 The script (one conversation; it exercises every prototype requirement in about 10 minutes):
@@ -241,9 +266,9 @@ metrics, database structure questions (`describe_data` tool), multi-step analysi
 with action items. All of these are driven by the instructions in `agent.py`, the data dictionary
 (`knowledge/data_dictionary.yaml`: columns, allowed values, metric definitions such as revenue,
 churn and return rate) and the golden trios. Each one is in the recorded run
-([docs/example-run.md](docs/example-run.md)): data structure, top customers and spend, the Calvin
-Klein vs Columbia comparison, multi-step "why" analysis and the Q1 report in part 1, and monthly
-and year-to-date revenue by product in part 2.
+on real BigQuery ([docs/example-run.md](docs/example-run.md)): data structure, top customers and
+spend, the Calvin Klein vs Columbia comparison, multi-step "why" analysis, the Q1 report, and
+monthly and year-to-date revenue by product.
 
 ---
 
@@ -271,8 +296,8 @@ Alternatives considered:
 - **Google ADK**: a strong fit for GCP-native deployment (Agent Engine); a reasonable choice
   for the production build.
 
-**My experience with it:** *TODO (Matej): state your level of experience with Pydantic AI, or
-with the framework you choose to present.*
+**My experience with it:** I have used Pydantic AI across multiple AI projects, so this build
+starts from a framework I know well.
 
 ---
 
