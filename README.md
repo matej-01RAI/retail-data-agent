@@ -33,8 +33,9 @@ pip install -r requirements.txt
 
 cp .env.example .env              # then set GEMINI_API_KEY and GOOGLE_CLOUD_PROJECT
 gcloud auth application-default login                  # BigQuery credentials
-#   (no browser? put a service-account key in GCP_SA_KEY_JSON instead: used in memory, never written to disk;
-#    give that account the BigQuery Job User role in the GOOGLE_CLOUD_PROJECT project)
+#   (no browser? use a service-account key with the BigQuery Job User role in the GOOGLE_CLOUD_PROJECT
+#    project: GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json in .env, or the key itself on one line
+#    in GCP_SA_KEY_JSON, e.g. from `jq -c . key.json`; GCP_SA_KEY_JSON is held in memory only)
 
 python -m retail_agent doctor     # checks Python, Gemini, credentials, schema, a test query
 python -m retail_agent --user ceo # start chatting (other demo users: maria, tom)
